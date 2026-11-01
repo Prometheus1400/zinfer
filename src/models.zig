@@ -390,87 +390,57 @@ test "ModelInfo owns its paths parsed config and safetensors" {
     }
 }
 
-test "Qwen checkpoint pipeline produces causal logits through all layers" {
-    const c = @import("mlx_c");
+test "Qwen checkpoint generates matching owned buffered and streamed responses" {
     const build_options = @import("build_options");
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const model_dir_path = "models/qwen";
-    _ = std.Io.Dir.cwd().statFile(io, model_dir_path ++ "/model.safetensors", .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
-    const json = try std.Io.Dir.cwd().readFileAlloc(io, model_dir_path ++ "/config.json", gpa, .unlimited);
-    defer gpa.free(json);
-    const parsed = try std.json.parseFromSlice(QwenConfig, gpa, json, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const config = parsed.value;
 
     var strm = try mlx.init(.{ .require_gpu = build_options.metal });
     defer strm.deinit();
     const ctx: Context = .{ .gpa = gpa, .io = io, .stream = strm };
 
-    const tokens = 3;
-    const hidden_size: usize = config.hidden_size;
-    const shape = [_]c_int{ 1, tokens, @intCast(hidden_size) };
-    const data = try gpa.alloc(f32, tokens * hidden_size);
-    defer gpa.free(data);
-    for (data, 0..) |*value, i| {
-        value.* = (@as(f32, @floatFromInt(i % 29)) - 14.0) * 0.01;
-    }
-    const changed_data = try gpa.dupe(f32, data);
-    defer gpa.free(changed_data);
-    for (changed_data[2 * hidden_size ..], 0..) |*value, i| {
-        value.* += if (i % 2 == 0) @as(f32, 0.2) else -0.15;
-    }
-
-    // The pipeline accepts hidden states and returns vocabulary logits.
-    var output, var changed_output = blk: {
-        var info = try getModelInfo(ctx, "qwen");
+    var buffered, var streamed = blk: {
+        var info = getModelInfo(ctx, "qwen") catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
         defer info.deinit(gpa);
+        const config = switch (info.config) {
+            .qwen_config => |parsed| parsed.value,
+            .empty => return error.MissingModelConfig,
+        };
         var pipeline = try QwenHandler.buildPipeline(ctx, &info);
         defer pipeline.deinit();
         try std.testing.expect(config.num_hidden_layers > 0);
         try std.testing.expectEqual(@as(usize, config.num_hidden_layers), pipeline.transformer_layers.items.len);
 
-        var input = try mlx.Tensor.fromSlice(f32, data, &shape);
-        defer input.deinit();
-        var changed_input = try mlx.Tensor.fromSlice(f32, changed_data, &shape);
-        defer changed_input.deinit();
-        var result = try pipeline.call(input);
-        errdefer result.deinit();
-        const changed_result = try pipeline.call(changed_input);
-        break :blk .{ result, changed_result };
-    };
-    defer output.deinit();
-    defer changed_output.deinit();
+        var response = try pipeline.call("hi");
+        errdefer response.deinit(gpa);
 
-    // Evaluate after releasing ModelInfo, the pipeline, inputs, and
-    // intermediate handles to check that the graph retains its dependencies.
-    const output_shape = [_]c_int{ 1, tokens, @intCast(config.vocab_size) };
-    try std.testing.expectEqualSlices(c_int, &output_shape, try output.shape());
-    try std.testing.expectEqualSlices(c_int, &output_shape, try changed_output.shape());
-    try std.testing.expectEqual(mlx.DType.float32, try output.dtype());
-    try std.testing.expectEqual(mlx.DType.float32, try changed_output.dtype());
-    if (c.mlx_array_eval(output.p) != 0 or c.mlx_array_eval(changed_output.p) != 0)
-        return error.MlxEvaluationFailed;
-    const actual = c.mlx_array_data_float32(output.p);
-    const changed = c.mlx_array_data_float32(changed_output.p);
-    const strides = c.mlx_array_strides(output.p);
-    const changed_strides = c.mlx_array_strides(changed_output.p);
-    var final_token_changed = false;
-    for (0..tokens) |token| {
-        for (0..config.vocab_size) |feature| {
-            const value = actual[token * strides[1] + feature * strides[2]];
-            const changed_value = changed[token * changed_strides[1] + feature * changed_strides[2]];
-            try std.testing.expect(std.math.isFinite(value));
-            try std.testing.expect(std.math.isFinite(changed_value));
-            if (token < 2) {
-                try std.testing.expectApproxEqAbs(value, changed_value, 1e-4);
-            } else if (@abs(value - changed_value) > 1e-4) {
-                final_token_changed = true;
+        var writer = std.Io.Writer.Allocating.init(gpa);
+        defer writer.deinit();
+        var buffer: [2][]const u8 = undefined;
+        var queue: Queue([]const u8) = .init(&buffer);
+        {
+            const handle = try std.Thread.spawn(
+                .{},
+                model_utils.collectStreamingResponse,
+                .{ gpa, io, &queue, &writer.writer, model_utils.CollectOptions{} },
+            );
+            defer {
+                queue.close(io);
+                handle.join();
             }
+            try pipeline.callStreaming("hi", &queue);
         }
-    }
-    try std.testing.expect(final_token_changed);
+        try std.testing.expectError(error.Closed, queue.getOne(io));
+        break :blk .{ response, writer.toArrayList() };
+    };
+    defer buffered.deinit(gpa);
+    defer streamed.deinit(gpa);
+
+    // The returned text must remain valid after the pipeline and model are freed.
+    try std.testing.expect(buffered.items.len > 0);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(buffered.items));
+    try std.testing.expectEqualStrings(buffered.items, streamed.items);
 }
