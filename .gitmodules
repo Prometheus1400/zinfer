@@ -1,3 +1,9 @@
 [submodule "vendor/mlx-c"]
 	path = vendor/mlx-c
 	url = https://github.com/ml-explore/mlx-c.git
+[submodule "vendor/tokenizers-cpp"]
+	path = vendor/tokenizers-cpp
+	url = https://github.com/mlc-ai/tokenizers-cpp.git
+[submodule "vendor/minijinja"]
+	path = vendor/minijinja
+	url = https://github.com/mitsuhiko/minijinja.git
