@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
     b.step("minijinja", "Build the pinned MiniJinja C library").dependOn(&minijinja_native.step);
 
     const translate = b.addTranslateC(.{
-        .root_source_file = b.path("src/mlx/headers.h"),
+        .root_source_file = b.path("src/zinfer/mlx/headers.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -114,7 +114,7 @@ pub fn build(b: *std.Build) void {
     bindings_step.dependOn(&translate_minijinja.step);
 
     const chat_template = b.createModule(.{
-        .root_source_file = b.path("src/chat_template.zig"),
+        .root_source_file = b.path("src/zinfer/chat_template.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-chat-template", "Run MiniJinja wrapper and Qwen template tests").dependOn(&run_chat_template_tests.step);
 
     const mlx = b.createModule(.{
-        .root_source_file = b.path("src/mlx/root.zig"),
+        .root_source_file = b.path("src/zinfer/mlx/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -147,42 +147,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_chat_template_tests.step);
 
     const context = b.createModule(.{
-        .root_source_file = b.path("src/context.zig"),
+        .root_source_file = b.path("src/zinfer/context.zig"),
         .target = target,
         .optimize = optimize,
     });
     context.addImport("mlx", mlx);
 
-    const models_test_module = b.createModule(.{
-        .root_source_file = b.path("src/models.zig"),
+    const zinfer = b.addModule("zinfer", .{
+        .root_source_file = b.path("src/zinfer/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    models_test_module.addImport("mlx", mlx);
-    models_test_module.addImport("context", context);
-    models_test_module.addImport("mlx_c", bindings);
-    models_test_module.addImport("tokenizers_c", tokenizer_bindings);
-    models_test_module.addImport("chat_template", chat_template);
-    models_test_module.addImport("build_options", options_module);
-    const models_tests = b.addTest(.{ .root_module = models_test_module });
-    models_tests.step.dependOn(&native.step);
-    const run_models_tests = b.addRunArtifact(models_tests);
-    run_models_tests.stdio = .inherit;
-    run_models_tests.setCwd(b.path("."));
-    run_models_tests.step.dependOn(&run_tests.step);
-    test_step.dependOn(&run_models_tests.step);
+    zinfer.addImport("mlx", mlx);
+    zinfer.addImport("context", context);
+    zinfer.addImport("tokenizers_c", tokenizer_bindings);
+    zinfer.addImport("chat_template", chat_template);
+    zinfer.addImport("build_options", options_module);
+    const zinfer_tests = b.addTest(.{ .root_module = zinfer });
+    zinfer_tests.step.dependOn(&native.step);
+    const run_zinfer_tests = b.addRunArtifact(zinfer_tests);
+    run_zinfer_tests.stdio = .inherit;
+    run_zinfer_tests.setCwd(b.path("."));
+    run_zinfer_tests.step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_zinfer_tests.step);
 
     const app = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    app.addImport("mlx", mlx);
-    app.addImport("context", context);
-    app.addImport("tokenizers_c", tokenizer_bindings);
-    app.addImport("chat_template", chat_template);
+    app.addImport("zinfer", zinfer);
     // Installed binaries use sibling libraries; cached binaries use the
     // native build directory. Both paths are embedded, without DYLD overrides.
     app.addRPathSpecial("@executable_path/../lib");

@@ -1,9 +1,9 @@
 const std = @import("std");
-const mlx = @import("mlx");
+const zinfer = @import("zinfer");
+const mlx = zinfer.mlx;
 const args = @import("args.zig");
-const models = @import("models.zig");
-const model_utils = @import("model_utils.zig");
-pub const Context = @import("context").Context;
+const models = zinfer.models;
+pub const Context = zinfer.Context;
 const log = std.log.scoped(.main);
 const Queue = @import("std").Io.Queue;
 
@@ -14,7 +14,7 @@ fn inspectModel(ctx: Context, a: args.InspectArgs) !void {
     defer info.deinit(ctx.gpa);
 
     switch (info.config) {
-        .qwen_config => try models.QwenHandler.inspect(ctx, &info),
+        .qwen_config => try models.qwen.Handler.inspect(ctx, &info),
         .empty => {},
     }
 }
@@ -27,7 +27,7 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
 
     switch (info.config) {
         .qwen_config => {
-            var pipeline = try models.QwenHandler.buildPipeline(ctx, &info);
+            var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info);
             defer pipeline.deinit();
 
             if (a.stream) {
@@ -38,7 +38,7 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
                 var stdout_buf: [128]u8 = undefined;
                 var stdout = std.Io.File.stdout().writerStreaming(ctx.io, &stdout_buf);
                 {
-                    const handle = try std.Thread.spawn(.{}, model_utils.collectStreamingResponse, .{ ctx.gpa, ctx.io, &queue, &stdout.interface, model_utils.CollectOptions{} });
+                    const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, .{ ctx.gpa, ctx.io, &queue, &stdout.interface, models.CollectOptions{} });
                     defer {
                         queue.close(ctx.io);
                         std.Thread.join(handle);

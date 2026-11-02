@@ -50,12 +50,15 @@ Options: `-Dmetal=false`, `-Dnative-jobs=2` (default: 4), and
   editor background builds and terminal builds can share the cache safely.
 - `cmake/build-tokenizers.cmake`: builds the Rust tokenizer C library under a
   separate lock. Generated `@import("tokenizers_c")` bindings and static linking
-  are available to the application and model tests.
+  are available inside the runtime module.
 - `cmake/tokenizers.h`: the translation unit including `tokenizers_c.h`.
 - `cmake/build-minijinja.cmake`: builds the static MiniJinja C library under a
   separate lock using upstream's Cargo lockfile.
-- `src/chat_template.zig`: the owning `ChatTemplate` wrapper and its tests.
-- `src/mlx/headers.h`: the single translation unit including `mlx/c/mlx.h`.
+- `src/zinfer/root.zig`: the public runtime API, imported with `@import("zinfer")`.
+- `src/zinfer/models/`: shared model loading and the Qwen implementation.
+- `src/zinfer/chat_template.zig`: the owning `ChatTemplate` wrapper and its tests.
+- `src/zinfer/mlx/headers.h`: the single translation unit including `mlx/c/mlx.h`.
+- `src/cli/`: command-line argument parsing and the executable entry point.
 - `vendor/mlx-c`: unmodified upstream submodule.
 - `vendor/tokenizers-cpp`: unmodified upstream tokenizer submodule.
 - `vendor/minijinja`: unmodified upstream template engine submodule.
@@ -70,10 +73,10 @@ Generated bindings and compiled dependencies are ignored by Git.
 
 ## Chat templates
 
-The application and model tests can use `@import("chat_template")`:
+Applications can access chat templates through the runtime module:
 
 ```zig
-const ChatTemplate = @import("chat_template").ChatTemplate;
+const ChatTemplate = @import("zinfer").ChatTemplate;
 
 var template = try ChatTemplate.init(gpa, config.chat_template);
 defer template.deinit();
