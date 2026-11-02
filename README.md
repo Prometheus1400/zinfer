@@ -73,23 +73,10 @@ Generated bindings and compiled dependencies are ignored by Git.
 
 ## Chat templates
 
-Applications can access chat templates through the runtime module:
+The Qwen pipeline loads the `chat_template` from `tokenizer_config.json` and
+renders it once before encoding the prompt, including the assistant prefix.
+The tokenizer and chat-template wrappers are internal to the runtime; the public
+`zinfer` module exports `mlx`, `Context`, and `models`.
 
-```zig
-const ChatTemplate = @import("zinfer").ChatTemplate;
-
-var template = try ChatTemplate.init(gpa, config.chat_template);
-defer template.deinit();
-
-const prompt = try template.render(gpa, &.{
-    .{ .role = "user", .content = "hi" },
-}, .{});
-defer gpa.free(prompt);
-```
-
-Pass the `chat_template` string parsed from `tokenizer_config.json` to `init`.
-`render` accepts text messages and adds the assistant prefix by default; use
-`.{ .add_generation_prompt = false }` to omit it. The returned prompt owns its
-bytes and can be passed to the tokenizer's `encode` method. Tool schemas and
-multimodal content are not exposed by this wrapper. The generation pipeline
-does not apply the template automatically yet.
+Chat templates support text messages. Tool schemas and multimodal content are
+not supplied to the template.

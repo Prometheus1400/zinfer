@@ -146,13 +146,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_chat_template_tests.step);
 
-    const context = b.createModule(.{
-        .root_source_file = b.path("src/zinfer/context.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    context.addImport("mlx", mlx);
-
     const zinfer = b.addModule("zinfer", .{
         .root_source_file = b.path("src/zinfer/root.zig"),
         .target = target,
@@ -160,7 +153,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     zinfer.addImport("mlx", mlx);
-    zinfer.addImport("context", context);
     zinfer.addImport("tokenizers_c", tokenizer_bindings);
     zinfer.addImport("chat_template", chat_template);
     zinfer.addImport("build_options", options_module);

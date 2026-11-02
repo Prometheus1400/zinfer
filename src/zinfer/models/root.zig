@@ -1,9 +1,31 @@
 const std = @import("std");
 const mlx = @import("mlx");
-const Context = @import("context").Context;
+const Context = @import("../context.zig").Context;
 const Queue = std.Io.Queue;
 
 pub const qwen = @import("qwen.zig");
+
+const CommonConfig = struct {
+    model_type: []const u8,
+};
+
+pub const ModelConfig = union(enum) {
+    const Self = @This();
+
+    qwen_config: std.json.Parsed(qwen.Config),
+    empty,
+
+    pub fn deinit(self: *Self) void {
+        switch (self.*) {
+            .qwen_config => |config| {
+                config.deinit();
+            },
+            .empty => {},
+        }
+
+        self.* = .empty;
+    }
+};
 
 pub const ModelInfo = struct {
     model_dir: []const u8,
@@ -26,49 +48,6 @@ pub const ModelInfo = struct {
         self.config.deinit();
     }
 };
-
-pub const ModelConfig = union(enum) {
-    const Self = @This();
-
-    qwen_config: std.json.Parsed(qwen.Config),
-    empty,
-
-    pub fn deinit(self: *Self) void {
-        switch (self.*) {
-            .qwen_config => |config| {
-                config.deinit();
-            },
-            .empty => {},
-        }
-
-        self.* = .empty;
-    }
-};
-
-pub const CommonConfig = struct {
-    model_type: []const u8,
-};
-
-pub const CollectOptions = struct {
-    flush: bool = true,
-};
-
-pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writer: *std.Io.Writer, options: CollectOptions) !void {
-    while (true) {
-        const token = queue.getOne(io) catch |e| {
-            switch (e) {
-                error.Closed => break,
-                error.Canceled => return e,
-            }
-        };
-        defer gpa.free(token);
-
-        try writer.writeAll(token);
-        if (options.flush) {
-            try writer.flush();
-        }
-    }
-}
 
 pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
     const model_dir_path = try ctx.gpa.print("{s}/{s}", .{ "models", model });
@@ -113,6 +92,27 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
     }
 
     return error.UnknownModel;
+}
+
+pub const CollectOptions = struct {
+    flush: bool = true,
+};
+
+pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writer: *std.Io.Writer, options: CollectOptions) !void {
+    while (true) {
+        const token = queue.getOne(io) catch |e| {
+            switch (e) {
+                error.Closed => break,
+                error.Canceled => return e,
+            }
+        };
+        defer gpa.free(token);
+
+        try writer.writeAll(token);
+        if (options.flush) {
+            try writer.flush();
+        }
+    }
 }
 
 test "ModelInfo owns its paths parsed config and safetensors" {

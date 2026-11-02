@@ -3,9 +3,9 @@ const zinfer = @import("zinfer");
 const mlx = zinfer.mlx;
 const args = @import("args.zig");
 const models = zinfer.models;
-pub const Context = zinfer.Context;
+const Context = zinfer.Context;
 const log = std.log.scoped(.main);
-const Queue = @import("std").Io.Queue;
+const Queue = std.Io.Queue;
 
 fn inspectModel(ctx: Context, a: args.InspectArgs) !void {
     log.debug("inspecting model: {s}", .{a.model});
@@ -20,8 +20,6 @@ fn inspectModel(ctx: Context, a: args.InspectArgs) !void {
 }
 
 fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
-    log.debug("generating response from model: {s} with prompt: {s}", .{ a.model, a.prompt });
-
     var info = try models.getModelInfo(ctx, a.model);
     defer info.deinit(ctx.gpa);
 

@@ -1,11 +1,13 @@
 const std = @import("std");
 const mlx = @import("mlx");
-const Context = @import("context").Context;
+const Context = @import("../context.zig").Context;
 const Tokenizer = @import("../tokenizer.zig").Tokenizer;
 const template = @import("chat_template");
 const ChatTemplate = template.ChatTemplate;
 const Queue = std.Io.Queue;
 const models = @import("root.zig");
+
+const log = std.log.scoped(.qwen);
 
 pub const Config = struct {
     architectures: []const []const u8,
@@ -33,7 +35,7 @@ pub const Config = struct {
     vocab_size: u32,
 };
 
-pub const TokenizerConfig = struct {
+const TokenizerConfig = struct {
     chat_template: []const u8,
 };
 
@@ -49,7 +51,7 @@ pub const Pipeline = struct {
     embedding_weights: mlx.Tensor,
     chat_template: ChatTemplate,
 
-    pub fn preprocess(self: Self, input: []const u8) !mlx.Tensor {
+    fn preprocess(self: Self, input: []const u8) !mlx.Tensor {
         const messages: []const template.Message = &.{
             .{ .role = "user", .content = input },
         };
@@ -61,14 +63,22 @@ pub const Pipeline = struct {
     }
 
     pub fn callStreaming(self: Self, input: []const u8, output: *Queue([]const u8)) !void {
+        log.debug("generating response for: \"{s}...\"", .{input[0..@min(25, input.len)]});
         defer output.close(self.io);
 
         var encoded_input = try self.preprocess(input);
         defer encoded_input.deinit();
 
+        log.debug("encoded prompt into token IDs (dimensions={any})", .{encoded_input.shape()});
+
+        var first_pass = true;
         while (true) {
+            defer first_pass = false;
             var ref = try self.embedding_weights.take(encoded_input, 0, self.strm);
             defer ref.deinit();
+
+            if (first_pass)
+                log.debug("looked up token embeddings (dimensions={any})", .{ref.shape()});
 
             for (self.transformer_layers.items) |*l| {
                 const next_ref = try mlx.nn.Layer.forward(l, ref, self.strm);
@@ -76,29 +86,48 @@ pub const Pipeline = struct {
                 ref = next_ref;
             }
 
+            if (first_pass)
+                log.debug("computed hidden states through {d} transformer layers (dimensions={any})", .{ self.transformer_layers.items.len, ref.shape() });
+
             try ref.rmsMut(self.norm, self.strm);
 
+            if (first_pass)
+                log.debug("applied final RMS normalization to hidden states (dimensions={any})", .{ref.shape()});
+
             const ref_shape = try ref.shape();
-            const tokens = ref_shape[1];
-            const logits = ref_shape[2];
-            var final_logits = try ref.slice(&[_]c_int{ 0, tokens - 1, 0 }, &[_]c_int{ 1, tokens, logits }, &[_]c_int{ 1, 1, 1 }, self.strm);
-            defer final_logits.deinit();
+            const tokens_size = ref_shape[1];
+            const logits_size = ref_shape[2];
+            var logits = try ref.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ 1, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
+            defer logits.deinit();
+
+            if (first_pass)
+                log.debug("selected the last token position's hidden state (dimensions={any})", .{logits.shape()});
 
             var projection = try self.embedding_weights.transpose(self.strm);
             defer projection.deinit();
 
-            try final_logits.matMulMut(projection, self.strm);
+            try logits.matMulMut(projection, self.strm);
 
-            var id_tensor = try final_logits.argmax(-1, self.strm);
+            if (first_pass)
+                log.debug("projected the last hidden state into vocabulary logits (dimensions={any})", .{logits.shape()});
+
+            var id_tensor = try logits.argmax(-1, self.strm);
             defer id_tensor.deinit();
 
             const id = try id_tensor.itemU32();
+
+            const token = try self.tokenizer.decode(self.gpa, &[1]u32{id});
+            errdefer self.gpa.free(token);
+
+            if (first_pass)
+                log.debug("selected the next token ID with argmax (dimensions={any}, id={d}, text={s})", .{ id_tensor.shape(), id, token });
+
             if (id == 151645 or id == 151643) break;
 
             try encoded_input.concatMut(id_tensor, -1, self.strm);
 
-            const token = try self.tokenizer.decode(self.gpa, &[1]u32{id});
-            errdefer self.gpa.free(token);
+            if (first_pass)
+                log.debug("appended the generated token ID to the input sequence (dimensions={any})", .{encoded_input.shape()});
 
             _ = try output.put(self.io, &[1][]const u8{token}, 1);
         }
