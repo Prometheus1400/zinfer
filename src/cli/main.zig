@@ -20,8 +20,11 @@ fn inspectModel(ctx: Context, a: args.InspectArgs) !void {
     var info = try models.getModelInfo(ctx, a.model);
     defer info.deinit(ctx.gpa);
 
+    var stdout_buf: [128]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(ctx.io, &stdout_buf);
+
     switch (info.config) {
-        .qwen_config => try models.qwen.Handler.inspect(ctx, &info),
+        .qwen_config => try models.qwen.Handler.inspect(ctx, &info, &stdout.interface),
         .empty => {},
     }
 }
@@ -30,9 +33,13 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
     var info = try models.getModelInfo(ctx, a.model);
     defer info.deinit(ctx.gpa);
 
+    var stdout_buf: [128]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(ctx.io, &stdout_buf);
+    var stdout = &stdout_writer.interface;
+
     switch (info.config) {
         .qwen_config => {
-            var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info);
+            var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info, .{});
             defer pipeline.deinit();
 
             if (a.stream) {
@@ -40,21 +47,20 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
                 var queue: Queue([]const u8) = .init(&queue_buf);
                 errdefer queue.close(ctx.io);
 
-                var stdout_buf: [128]u8 = undefined;
-                var stdout = std.Io.File.stdout().writerStreaming(ctx.io, &stdout_buf);
                 {
-                    const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, .{ ctx.gpa, ctx.io, &queue, &stdout.interface, models.CollectOptions{} });
+                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, stdout, .{} };
+                    const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
                     defer {
                         queue.close(ctx.io);
                         std.Thread.join(handle);
                     }
                     try pipeline.callStreaming(a.prompt, &queue);
                 }
-                std.debug.print("\n", .{});
+                try stdout.print("\n", .{});
             } else {
                 var res = try pipeline.call(a.prompt);
                 defer res.deinit(ctx.gpa);
-                std.debug.print("{s}\n", .{res.items});
+                try stdout.print("{s}\n", .{res.items});
             }
         },
         .empty => {},

@@ -89,6 +89,77 @@ test "slice selects a head and retains its input" {
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 7 }, actual[0..4]);
 }
 
+test "slice updates fill cache positions while preserving earlier values and lazy dependencies" {
+    const std = @import("std");
+    const c = @import("mlx_c");
+    const build_options = @import("build_options");
+    var strm = try init(.{ .require_gpu = build_options.metal });
+    defer strm.deinit();
+
+    const initial = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    var original = try Tensor.fromSlice(f32, &initial, &.{ 1, 2, 4, 2 });
+    defer original.deinit();
+    var cache = try original.clone();
+    defer cache.deinit();
+
+    var first = blk: {
+        var update = try Tensor.fromSlice(f32, &.{ 100, 101, 110, 111 }, &.{ 1, 2, 1, 2 });
+        defer update.deinit();
+        break :blk try cache.sliceUpdate(update, &.{ 0, 0, 1, 0 }, &.{ 1, 2, 2, 2 }, &.{ 1, 1, 1, 1 }, strm);
+    };
+    defer first.deinit();
+
+    cache.deinit();
+    cache = try first.clone();
+    {
+        var update = try Tensor.fromSlice(f32, &.{ 200, 201, 202, 203, 210, 211, 212, 213 }, &.{ 1, 2, 2, 2 });
+        defer update.deinit();
+        try cache.sliceUpdateMut(update, &.{ 0, 0, 2, 0 }, &.{ 1, 2, 4, 2 }, &.{ 1, 1, 1, 1 }, strm);
+    }
+
+    const expected_first = [_]f32{ 0, 1, 100, 101, 4, 5, 6, 7, 8, 9, 110, 111, 12, 13, 14, 15 };
+    const expected_cache = [_]f32{ 0, 1, 100, 101, 200, 201, 202, 203, 8, 9, 110, 111, 210, 211, 212, 213 };
+    const Case = struct { tensor: Tensor, expected: []const f32 };
+    for ([_]Case{
+        .{ .tensor = cache, .expected = &expected_cache },
+        .{ .tensor = first, .expected = &expected_first },
+        .{ .tensor = original, .expected = &initial },
+    }) |case| {
+        try std.testing.expectEqualSlices(c_int, &.{ 1, 2, 4, 2 }, try case.tensor.shape());
+        try case.tensor.eval();
+        try std.testing.expectEqualSlices(f32, case.expected, c.mlx_array_data_float32(case.tensor.p)[0..16]);
+    }
+}
+
+test "sliceUpdateMut broadcasts strided updates and preserves the handle on validation errors" {
+    const std = @import("std");
+    const c = @import("mlx_c");
+    const build_options = @import("build_options");
+    var strm = try init(.{ .require_gpu = build_options.metal });
+    defer strm.deinit();
+
+    var tensor = try Tensor.fromSlice(f32, &.{ 0, 1, 2, 3, 4, 5 }, &.{ 2, 3 });
+    defer tensor.deinit();
+    var empty = Tensor.new();
+    defer empty.deinit();
+    const before = tensor.p.ctx;
+    try std.testing.expectError(error.NullArray, tensor.sliceUpdateMut(empty, &.{ 0, 0 }, &.{ 2, 3 }, &.{ 1, 2 }, strm));
+    try std.testing.expectEqual(before, tensor.p.ctx);
+
+    {
+        var update = Tensor.scalar(9);
+        defer update.deinit();
+        const empty_stream: Stream = .{ .p = .{ .ctx = null } };
+        try std.testing.expectError(error.NullStream, tensor.sliceUpdateMut(update, &.{ 0, 0 }, &.{ 2, 3 }, &.{ 1, 2 }, empty_stream));
+        try std.testing.expectEqual(before, tensor.p.ctx);
+        try std.testing.expectError(error.NullArray, empty.sliceUpdate(update, &.{ 0, 0 }, &.{ 2, 3 }, &.{ 1, 2 }, strm));
+
+        try tensor.sliceUpdateMut(update, &.{ 0, 0 }, &.{ 2, 3 }, &.{ 1, 2 }, strm);
+    }
+    try tensor.eval();
+    try std.testing.expectEqualSlices(f32, &.{ 9, 1, 9, 9, 4, 9 }, c.mlx_array_data_float32(tensor.p)[0..6]);
+}
+
 test "softmax normalizes each row with large scores" {
     const std = @import("std");
     const c = @import("mlx_c");
@@ -157,6 +228,83 @@ test "categorical samples logits respects masking and removes the selected axis"
         counts[id] += 1;
     }
     try std.testing.expect(counts[0] > 0 and counts[1] > 0);
+}
+
+test "scaled dot product attention matches scalar GQA with unmasked causal and tensor masks" {
+    const std = @import("std");
+    const c = @import("mlx_c");
+    const build_options = @import("build_options");
+    var strm = try init(.{ .require_gpu = build_options.metal });
+    defer strm.deinit();
+
+    const q_data = [_]f32{ 2, 0, 0, 2, 1, 2, 2, 1, -1, 1, 1, -1, 2, -2, -2, 2 };
+    const k_data = [_]f32{ 1, 0, 0, 1, 1, 1, 2, 0, 0, 2, -1, 1 };
+    const v_data = [_]f32{ 1, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60 };
+    const scale: f32 = 0.5;
+
+    // Unequal query/key lengths check causal alignment; one query checks decoding.
+    for ([_]c_int{ 2, 1 }) |query_count| {
+        const count: usize = @intCast(query_count);
+        const MaskKind = enum { none, causal, tensor };
+        for ([_]MaskKind{ .none, .causal, .tensor }) |kind| {
+            var result = blk: {
+                var q = try Tensor.fromSlice(f32, q_data[0 .. 4 * count * 2], &.{ 1, 4, query_count, 2 });
+                defer q.deinit();
+                var k = try Tensor.fromSlice(f32, &k_data, &.{ 1, 2, 3, 2 });
+                defer k.deinit();
+                var v = try Tensor.fromSlice(f32, &v_data, &.{ 1, 2, 3, 2 });
+                defer v.deinit();
+                var mask = try Tensor.fromSlice(f32, &.{ 0, -std.math.inf(f32), 0 }, &.{3});
+                defer mask.deinit();
+
+                var empty = Tensor.new();
+                defer empty.deinit();
+                try std.testing.expectError(error.NullArray, Tensor.scaledDotProductAttention(q, k, v, scale, .{ .tensor = empty }, strm));
+
+                break :blk try Tensor.scaledDotProductAttention(q, k, v, scale, switch (kind) {
+                    .none => .none,
+                    .causal => .causal,
+                    .tensor => .{ .tensor = mask },
+                }, strm);
+            };
+            defer result.deinit();
+
+            // Evaluation must still work after releasing all input handles.
+            try std.testing.expectEqualSlices(c_int, &.{ 1, 4, query_count, 2 }, try result.shape());
+            try result.eval();
+            const actual = c.mlx_array_data_float32(result.p)[0 .. 4 * count * 2];
+
+            for (0..4) |head| {
+                const kv_head = head / 2;
+                for (0..count) |query| {
+                    var scores: [3]f32 = undefined;
+                    for (0..3) |key| {
+                        const qi = (head * count + query) * 2;
+                        const ki = (kv_head * 3 + key) * 2;
+                        const blocked = switch (kind) {
+                            .none => false,
+                            .causal => key > query + 3 - count,
+                            .tensor => key == 1,
+                        };
+                        scores[key] = if (blocked) -std.math.inf(f32) else scale * (q_data[qi] * k_data[ki] + q_data[qi + 1] * k_data[ki + 1]);
+                    }
+                    const max_score = @max(scores[0], @max(scores[1], scores[2]));
+                    var total: f32 = 0;
+                    for (&scores) |*score| {
+                        score.* = @exp(score.* - max_score);
+                        total += score.*;
+                    }
+                    for (0..2) |dim| {
+                        var expected: f32 = 0;
+                        for (scores, 0..) |weight, key| {
+                            expected += weight / total * v_data[(kv_head * 3 + key) * 2 + dim];
+                        }
+                        try std.testing.expectApproxEqAbs(expected, actual[(head * count + query) * 2 + dim], 1e-4);
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "RoPE matches split-half rotations at zero and nonzero offsets" {

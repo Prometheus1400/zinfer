@@ -86,6 +86,29 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
+    /// Returns an owned, lazy tensor with the selected slice replaced by update.
+    /// Bounds and strides follow slice(); update must broadcast to that slice.
+    pub fn sliceUpdate(src: Tensor, update: Tensor, start: []const c_int, stop: []const c_int, strides: []const c_int, strm: stream.Stream) !Tensor {
+        try common.ensure(.{ src, update, strm });
+
+        var res = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(res);
+
+        try common.check(c.mlx_slice_update(
+            &res,
+            src.p,
+            update.p,
+            start.ptr,
+            start.len,
+            stop.ptr,
+            stop.len,
+            strides.ptr,
+            strides.len,
+            strm.p,
+        ));
+        return .{ .p = res };
+    }
+
     pub fn formatInto(self: Self, buf: []u8) ![]const u8 {
         try common.ensure(.{self});
         var text = c.mlx_string_new();
@@ -229,6 +252,48 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
+    pub const AttentionMask = union(enum) {
+        none,
+        /// Aligns the last query with the last key, including during decoding.
+        causal,
+        /// Boolean or additive mask broadcastable to [batch, query_heads, queries, keys].
+        tensor: Tensor,
+    };
+
+    /// Computes softmax(scale * QK^T + mask) V, returning an owned, lazy tensor.
+    /// Q: [batch, query_heads, queries, head_dim].
+    /// K/V: [batch, kv_heads, keys, head_dim/value_dim].
+    /// Query heads must be a multiple of KV heads; do not repeat K/V for GQA.
+    /// The usual scale is 1 / sqrt(head_dim).
+    pub fn scaledDotProductAttention(q: Tensor, k: Tensor, v: Tensor, scale: f32, mask: AttentionMask, strm: stream.Stream) !Tensor {
+        try common.ensure(.{ q, k, v, strm });
+        if (mask == .tensor) try common.ensure(.{mask.tensor});
+
+        var res = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(res);
+
+        try common.check(c.mlx_fast_scaled_dot_product_attention(
+            &res,
+            q.p,
+            k.p,
+            v.p,
+            scale,
+            switch (mask) {
+                .none => "",
+                .causal => "causal",
+                .tensor => "array",
+            },
+            switch (mask) {
+                .tensor => |t| t.p,
+                else => .{ .ctx = null },
+            },
+            .{ .ctx = null }, // No attention sinks.
+            false, // Let MLX choose the appropriate implementation.
+            strm.p,
+        ));
+        return .{ .p = res };
+    }
+
     /// Uses split-half rotation with unscaled token positions.
     pub fn rope(a: Tensor, dims: c_int, base: f32, offset: c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
@@ -283,6 +348,10 @@ pub const Tensor = struct {
     // Mut methods replace this wrapper's owned handle, not necessarily its
     // underlying buffer. Creating a result must succeed before releasing the
     // old handle. The caller still calls deinit once on this wrapper.
+
+    pub fn sliceUpdateMut(self: *Self, update: Tensor, start: []const c_int, stop: []const c_int, strides: []const c_int, strm: stream.Stream) !void {
+        self.replace(try sliceUpdate(self.*, update, start, stop, strides, strm));
+    }
 
     pub fn matMulMut(self: *Self, b: Tensor, strm: stream.Stream) !void {
         self.replace(try matMul(self.*, b, strm));

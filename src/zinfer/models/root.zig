@@ -6,10 +6,6 @@ const Queue = std.Io.Queue;
 
 pub const qwen = @import("qwen.zig");
 
-const CommonConfig = struct {
-    model_type: []const u8,
-};
-
 pub const ModelConfig = union(enum) {
     const Self = @This();
 
@@ -74,7 +70,7 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
     const text = try model_dir.readFileAlloc(ctx.io, "config.json", ctx.gpa, .unlimited);
     defer ctx.gpa.free(text);
 
-    const common_config = try std.json.parseFromSlice(CommonConfig, ctx.gpa, text, .{ .ignore_unknown_fields = true });
+    const common_config = try std.json.parseFromSlice(struct { model_type: []const u8 }, ctx.gpa, text, .{ .ignore_unknown_fields = true });
     defer common_config.deinit();
 
     if (std.mem.eql(u8, common_config.value.model_type, "qwen2")) {
@@ -83,17 +79,22 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
             .allocate = .alloc_always,
         });
         errdefer qwen_config.deinit();
+
         const weights_file_path = try std.mem.concatWithSentinel(ctx.gpa, u8, &.{ model_dir_path, "/", qwen.Handler.WEIGHTS_FILE }, 0);
         errdefer ctx.gpa.free(weights_file_path);
+
         const tokenizer_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.TOKENIZER_FILE });
         errdefer ctx.gpa.free(tokenizer_file_path);
+
         const tokenizer_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.TOKENIZER_CONFIG_FILE });
         errdefer ctx.gpa.free(tokenizer_config_file_path);
+
         const generation_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.GENERATION_CONFIG_FILE });
         errdefer ctx.gpa.free(generation_config_file_path);
 
         const generation_json = try model_dir.readFileAlloc(ctx.io, qwen.Handler.GENERATION_CONFIG_FILE, ctx.gpa, .unlimited);
         defer ctx.gpa.free(generation_json);
+
         const generation_config = try std.json.parseFromSlice(GenerationConfig, ctx.gpa, generation_json, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -119,11 +120,7 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
     return error.UnknownModel;
 }
 
-pub const CollectOptions = struct {
-    flush: bool = true,
-};
-
-pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writer: *std.Io.Writer, options: CollectOptions) !void {
+pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writer: *std.Io.Writer, options: struct { flush: bool = true }) !void {
     while (true) {
         const token = queue.getOne(io) catch |e| {
             switch (e) {
