@@ -1,11 +1,18 @@
+const args = @import("args.zig");
+const build_options = @import("build_options");
+const mlx = zinfer.mlx;
+const models = zinfer.models;
 const std = @import("std");
 const zinfer = @import("zinfer");
-const mlx = zinfer.mlx;
-const args = @import("args.zig");
-const models = zinfer.models;
+
 const Context = zinfer.Context;
-const log = std.log.scoped(.main);
 const Queue = std.Io.Queue;
+
+const log = std.log.scoped(.main);
+
+pub const std_options: std.Options = .{
+    .log_level = @field(std.log.Level, @tagName(build_options.log_level)),
+};
 
 fn inspectModel(ctx: Context, a: args.InspectArgs) !void {
     log.debug("inspecting model: {s}", .{a.model});

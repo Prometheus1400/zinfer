@@ -43,6 +43,14 @@ zig build test-chat-template # test the wrapper and local Qwen chat template
 Options: `-Dmetal=false`, `-Dnative-jobs=2` (default: 4), and
 `-Doptimize=ReleaseFast`. Native libraries always build in Release mode.
 
+Use `-Dlog-level=err|warn|info|debug` to set the CLI's compile-time log level,
+including runtime library logs. The default is `debug` in Debug builds and
+`info` in release builds. For example:
+
+```sh
+zig build run -Dlog-level=info -- prompt --model qwen -p hi
+```
+
 ## Layout
 
 - `build.zig`: native build orchestration, C translation, linking, and installation.

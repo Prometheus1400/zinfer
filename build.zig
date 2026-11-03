@@ -7,9 +7,12 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag != .macos or target.result.cpu.arch != .aarch64)
         @panic("zinfer currently supports native Apple Silicon macOS builds");
     const optimize = b.standardOptimizeOption(.{});
+    const log_level = b.option(std.log.Level, "log-level", "Log level: err, warn, info, or debug (default: debug in Debug builds, info in release builds)") orelse
+        if (optimize == .debug) std.log.Level.debug else std.log.Level.info;
     const metal = b.option(bool, "metal", "Enable the Metal GPU backend (requires Xcode's Metal compiler)") orelse true;
     const build_options = b.addOptions();
     build_options.addOption(bool, "metal", metal);
+    build_options.addOption(std.log.Level, "log_level", log_level);
     const options_module = build_options.createModule();
     const jobs = b.option(u32, "native-jobs", "Maximum parallel native compilation jobs") orelse 4;
     const native_dir = std.Build.LazyPath.cache_root.path(b, if (metal) "native-mlx/metal" else "native-mlx/cpu");
@@ -171,6 +174,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     app.addImport("zinfer", zinfer);
+    app.addImport("build_options", options_module);
     // Installed binaries use sibling libraries; cached binaries use the
     // native build directory. Both paths are embedded, without DYLD overrides.
     app.addRPathSpecial("@executable_path/../lib");
