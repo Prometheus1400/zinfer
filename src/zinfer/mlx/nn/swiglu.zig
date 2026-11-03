@@ -1,6 +1,6 @@
 const Tensor = @import("../tensor.zig").Tensor;
 const Map = @import("../map.zig").Map;
-const MlxStream = @import("../stream.zig").MlxStream;
+const Stream = @import("../stream.zig").Stream;
 const loadWeight = @import("weights.zig").load;
 
 pub const SwiGluBlock = struct {
@@ -33,7 +33,7 @@ pub const SwiGluBlock = struct {
         self.down_proj_w.deinit();
     }
 
-    pub fn forward(self: *Self, x: Tensor, strm: MlxStream) !Tensor {
+    pub fn forward(self: *Self, x: Tensor, strm: Stream) !Tensor {
         var gate_proj_w_tran = try self.gate_proj_w.transpose(strm);
         defer gate_proj_w_tran.deinit();
         var mlp_output = try Tensor.matMul(x, gate_proj_w_tran, strm);

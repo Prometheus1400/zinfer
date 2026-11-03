@@ -1,5 +1,6 @@
-const std = @import("std");
 const mlx = @import("mlx");
+const std = @import("std");
+
 const Context = @import("../context.zig").Context;
 const Queue = std.Io.Queue;
 
@@ -27,6 +28,18 @@ pub const ModelConfig = union(enum) {
     }
 };
 
+pub const GenerationConfig = struct {
+    bos_token_id: ?u32 = null,
+    pad_token_id: ?u32 = null,
+    do_sample: bool = false,
+    eos_token_id: []const u32 = &.{},
+    repetition_penalty: f32 = 1.0,
+    temperature: f32 = 1.0,
+    top_p: f32 = 1.0,
+    top_k: u32 = 50,
+    transformers_version: ?[]const u8 = null,
+};
+
 pub const ModelInfo = struct {
     model_dir: []const u8,
     safetensor_file_path: [:0]const u8,
@@ -34,6 +47,7 @@ pub const ModelInfo = struct {
     tokenizer_config_file_path: []const u8,
     generation_config_file_path: []const u8,
     config: ModelConfig,
+    generation_config: std.json.Parsed(GenerationConfig),
     safetensor_metadata: mlx.Map(.string),
     safetensor_weights: mlx.Map(.tensor),
 
@@ -46,6 +60,7 @@ pub const ModelInfo = struct {
         gpa.free(self.tokenizer_config_file_path);
         gpa.free(self.generation_config_file_path);
         self.config.deinit();
+        self.generation_config.deinit();
     }
 };
 
@@ -76,6 +91,15 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
         errdefer ctx.gpa.free(tokenizer_config_file_path);
         const generation_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.GENERATION_CONFIG_FILE });
         errdefer ctx.gpa.free(generation_config_file_path);
+
+        const generation_json = try model_dir.readFileAlloc(ctx.io, qwen.Handler.GENERATION_CONFIG_FILE, ctx.gpa, .unlimited);
+        defer ctx.gpa.free(generation_json);
+        const generation_config = try std.json.parseFromSlice(GenerationConfig, ctx.gpa, generation_json, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        errdefer generation_config.deinit();
+
         var metadata, var weights = try mlx.io.loadSafetensors(ctx.stream, weights_file_path);
         errdefer metadata.deinit();
         errdefer weights.deinit();
@@ -86,6 +110,7 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
             .tokenizer_config_file_path = tokenizer_config_file_path,
             .generation_config_file_path = generation_config_file_path,
             .config = .{ .qwen_config = qwen_config },
+            .generation_config = generation_config,
             .safetensor_metadata = metadata,
             .safetensor_weights = weights,
         };
@@ -115,7 +140,7 @@ pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queu
     }
 }
 
-test "ModelInfo owns its paths parsed config and safetensors" {
+test "ModelInfo owns its paths parsed model and generation configs and safetensors" {
     var strm = try mlx.init(.{});
     defer strm.deinit();
     const ctx: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io, .stream = strm };
@@ -135,6 +160,18 @@ test "ModelInfo owns its paths parsed config and safetensors" {
     try std.testing.expectEqualStrings("models/qwen/tokenizer_config.json", info.tokenizer_config_file_path);
     try std.testing.expectEqualStrings("models/qwen/generation_config.json", info.generation_config_file_path);
     try std.testing.expectEqual(@as(u8, 0), info.safetensor_file_path[info.safetensor_file_path.len]);
+
+    const generation = info.generation_config.value;
+    try std.testing.expectEqual(@as(?u32, 151643), generation.bos_token_id);
+    try std.testing.expectEqual(@as(?u32, 151643), generation.pad_token_id);
+    try std.testing.expect(generation.do_sample);
+    try std.testing.expectEqualSlices(u32, &.{ 151645, 151643 }, generation.eos_token_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1), generation.repetition_penalty, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), generation.temperature, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), generation.top_p, 1e-6);
+    try std.testing.expectEqual(@as(u32, 20), generation.top_k);
+    try std.testing.expectEqualStrings("4.37.0", generation.transformers_version.?);
+
     try info.safetensor_metadata.ensure();
     var embeddings = try info.safetensor_weights.get("model.embed_tokens.weight");
     defer embeddings.deinit();

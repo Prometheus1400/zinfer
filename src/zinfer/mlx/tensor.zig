@@ -1,7 +1,8 @@
-const std = @import("std");
 const c = @import("mlx_c");
-const stream = @import("stream.zig");
 const common = @import("common.zig");
+const std = @import("std");
+const stream = @import("stream.zig");
+
 const DType = @import("dtype.zig").DType;
 
 pub const Tensor = struct {
@@ -75,7 +76,7 @@ pub const Tensor = struct {
         return @fromBackingInt(d);
     }
 
-    pub fn slice(self: Self, start: []const c_int, stop: []const c_int, strides: []const c_int, strm: stream.MlxStream) !Tensor {
+    pub fn slice(self: Self, start: []const c_int, stop: []const c_int, strides: []const c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ self, strm });
         var res = c.mlx_array_new();
         errdefer _ = c.mlx_array_free(res);
@@ -111,7 +112,7 @@ pub const Tensor = struct {
     // Implemented as static methods to make that relationship more clear.
 
     /// Selects entries along axis using an integer tensor of indices.
-    pub fn take(a: Tensor, indices: Tensor, axis: c_int, strm: stream.MlxStream) !Tensor {
+    pub fn take(a: Tensor, indices: Tensor, axis: c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, indices, strm });
 
         var res = c.mlx_array_new();
@@ -121,7 +122,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn matMul(a: Tensor, b: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn matMul(a: Tensor, b: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, b, strm });
         var res = c.mlx_array_new();
         errdefer _ = c.mlx_array_free(res);
@@ -129,7 +130,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn mul(a: Tensor, b: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn mul(a: Tensor, b: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, b, strm });
         var res = c.mlx_array_new();
         errdefer _ = c.mlx_array_free(res);
@@ -137,7 +138,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn add(a: Tensor, b: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn add(a: Tensor, b: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, b, strm });
 
         var res = c.mlx_array_new();
@@ -146,7 +147,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn div(a: Tensor, b: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn div(a: Tensor, b: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, b, strm });
 
         var res = c.mlx_array_new();
@@ -155,7 +156,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn concat(a: Tensor, b: Tensor, axis: c_int, strm: stream.MlxStream) !Tensor {
+    pub fn concat(a: Tensor, b: Tensor, axis: c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, b, strm });
 
         const handles = [_]c.mlx_array{ a.p, b.p };
@@ -169,7 +170,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn transpose(a: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn transpose(a: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var res = c.mlx_array_new();
@@ -179,7 +180,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn silu(a: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn silu(a: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var sig = c.mlx_array_new();
@@ -196,7 +197,7 @@ pub const Tensor = struct {
     }
 
     /// Returns the index of the maximum along axis, removing that dimension.
-    pub fn argmax(a: Tensor, axis: c_int, strm: stream.MlxStream) !Tensor {
+    pub fn argmax(a: Tensor, axis: c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var res = c.mlx_array_new();
@@ -206,7 +207,19 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn softmax(a: Tensor, axis: c_int, strm: stream.MlxStream) !Tensor {
+    /// Samples uint32 indices from logits along axis, removing that dimension.
+    /// Uses MLX's default random state. Pass logits, not probabilities.
+    pub fn categorical(a: Tensor, axis: c_int, strm: stream.Stream) !Tensor {
+        try common.ensure(.{ a, strm });
+
+        var res = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(res);
+
+        try common.check(c.mlx_random_categorical(&res, a.p, axis, .{ .ctx = null }, strm.p));
+        return .{ .p = res };
+    }
+
+    pub fn softmax(a: Tensor, axis: c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var res = c.mlx_array_new();
@@ -217,7 +230,7 @@ pub const Tensor = struct {
     }
 
     /// Uses split-half rotation with unscaled token positions.
-    pub fn rope(a: Tensor, dims: c_int, base: f32, offset: c_int, strm: stream.MlxStream) !Tensor {
+    pub fn rope(a: Tensor, dims: c_int, base: f32, offset: c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var res = c.mlx_array_new();
@@ -237,7 +250,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn rms(a: Tensor, w: Tensor, strm: stream.MlxStream) !Tensor {
+    pub fn rms(a: Tensor, w: Tensor, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, w, strm });
 
         var res = c.mlx_array_new();
@@ -247,7 +260,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn reshape(a: Tensor, shape_: []const c_int, strm: stream.MlxStream) !Tensor {
+    pub fn reshape(a: Tensor, shape_: []const c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var res = c.mlx_array_new();
@@ -257,7 +270,7 @@ pub const Tensor = struct {
         return .{ .p = res };
     }
 
-    pub fn permute(a: Tensor, axes: []const c_int, strm: stream.MlxStream) !Tensor {
+    pub fn permute(a: Tensor, axes: []const c_int, strm: stream.Stream) !Tensor {
         try common.ensure(.{ a, strm });
 
         var res = c.mlx_array_new();
@@ -271,51 +284,51 @@ pub const Tensor = struct {
     // underlying buffer. Creating a result must succeed before releasing the
     // old handle. The caller still calls deinit once on this wrapper.
 
-    pub fn matMulMut(self: *Self, b: Tensor, strm: stream.MlxStream) !void {
+    pub fn matMulMut(self: *Self, b: Tensor, strm: stream.Stream) !void {
         self.replace(try matMul(self.*, b, strm));
     }
 
-    pub fn mulMut(self: *Self, b: Tensor, strm: stream.MlxStream) !void {
+    pub fn mulMut(self: *Self, b: Tensor, strm: stream.Stream) !void {
         self.replace(try mul(self.*, b, strm));
     }
 
-    pub fn addMut(self: *Self, b: Tensor, strm: stream.MlxStream) !void {
+    pub fn addMut(self: *Self, b: Tensor, strm: stream.Stream) !void {
         self.replace(try add(self.*, b, strm));
     }
 
-    pub fn divMut(self: *Self, b: Tensor, strm: stream.MlxStream) !void {
+    pub fn divMut(self: *Self, b: Tensor, strm: stream.Stream) !void {
         self.replace(try div(self.*, b, strm));
     }
 
-    pub fn concatMut(self: *Self, b: Tensor, axis: c_int, strm: stream.MlxStream) !void {
+    pub fn concatMut(self: *Self, b: Tensor, axis: c_int, strm: stream.Stream) !void {
         self.replace(try concat(self.*, b, axis, strm));
     }
 
-    pub fn transposeMut(self: *Self, strm: stream.MlxStream) !void {
+    pub fn transposeMut(self: *Self, strm: stream.Stream) !void {
         self.replace(try transpose(self.*, strm));
     }
 
-    pub fn siluMut(self: *Self, strm: stream.MlxStream) !void {
+    pub fn siluMut(self: *Self, strm: stream.Stream) !void {
         self.replace(try silu(self.*, strm));
     }
 
-    pub fn softmaxMut(self: *Self, axis: c_int, strm: stream.MlxStream) !void {
+    pub fn softmaxMut(self: *Self, axis: c_int, strm: stream.Stream) !void {
         self.replace(try softmax(self.*, axis, strm));
     }
 
-    pub fn ropeMut(self: *Self, dims: c_int, base: f32, offset: c_int, strm: stream.MlxStream) !void {
+    pub fn ropeMut(self: *Self, dims: c_int, base: f32, offset: c_int, strm: stream.Stream) !void {
         self.replace(try rope(self.*, dims, base, offset, strm));
     }
 
-    pub fn rmsMut(self: *Self, w: Tensor, strm: stream.MlxStream) !void {
+    pub fn rmsMut(self: *Self, w: Tensor, strm: stream.Stream) !void {
         self.replace(try rms(self.*, w, strm));
     }
 
-    pub fn reshapeMut(self: *Self, shape_: []const c_int, strm: stream.MlxStream) !void {
+    pub fn reshapeMut(self: *Self, shape_: []const c_int, strm: stream.Stream) !void {
         self.replace(try reshape(self.*, shape_, strm));
     }
 
-    pub fn permuteMut(self: *Self, axes: []const c_int, strm: stream.MlxStream) !void {
+    pub fn permuteMut(self: *Self, axes: []const c_int, strm: stream.Stream) !void {
         self.replace(try permute(self.*, axes, strm));
     }
 

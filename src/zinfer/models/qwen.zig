@@ -1,11 +1,14 @@
-const std = @import("std");
 const mlx = @import("mlx");
-const Context = @import("../context.zig").Context;
-const Tokenizer = @import("../tokenizer.zig").Tokenizer;
-const template = @import("chat_template");
-const ChatTemplate = template.ChatTemplate;
-const Queue = std.Io.Queue;
 const models = @import("root.zig");
+const std = @import("std");
+const template = @import("chat_template");
+
+const ChatTemplate = template.ChatTemplate;
+const Context = @import("../context.zig").Context;
+const Queue = std.Io.Queue;
+const Stream = mlx.Stream;
+const Tensor = mlx.Tensor;
+const Tokenizer = @import("../tokenizer.zig").Tokenizer;
 
 const log = std.log.scoped(.qwen);
 
@@ -39,19 +42,38 @@ const TokenizerConfig = struct {
     chat_template: []const u8,
 };
 
+const KVCachePair = struct {
+    k: ?Tensor = null,
+    v: ?Tensor = null,
+};
+
+const PipelineGenerationConfig = struct {
+    generation_config: models.GenerationConfig,
+    enable_kv_cache: bool = true,
+    greedy_sample: bool = false,
+};
+
 pub const Pipeline = struct {
     const Self = @This();
 
     gpa: std.mem.Allocator,
     io: std.Io,
-    strm: mlx.Stream,
+    strm: Stream,
     tokenizer: Tokenizer,
     transformer_layers: std.ArrayList(mlx.nn.TransformerBlock),
-    norm: mlx.Tensor,
-    embedding_weights: mlx.Tensor,
+    norm: Tensor,
+    embedding_weights: Tensor,
     chat_template: ChatTemplate,
+    /// Slice and string fields borrow ModelInfo; keep it alive with this pipeline.
+    kv_cache: std.ArrayList(KVCachePair),
+    pipeline_generation_config: PipelineGenerationConfig,
 
-    fn preprocess(self: Self, input: []const u8) !mlx.Tensor {
+    fn attention(self: Self, input: Tensor, layer: usize) !Tensor {
+        const transformer_layer = self.transformer_layers.items[layer];
+        return transformer_layer.forward(input, self.strm);
+    }
+
+    fn preprocess(self: Self, input: []const u8) !Tensor {
         const messages: []const template.Message = &.{
             .{ .role = "user", .content = input },
         };
@@ -60,6 +82,57 @@ pub const Pipeline = struct {
         defer self.gpa.free(initial_prompt);
 
         return self.tokenizer.encode(initial_prompt);
+    }
+
+    fn forward(self: Self, input: Tensor, prefill: bool) !?Tensor {
+        var ref = try self.embedding_weights.take(input, 0, self.strm);
+        defer ref.deinit();
+
+        for (self.transformer_layers.items, 0..) |*l, i| {
+            const layer_cache = &self.kv_cache.items[i];
+            const next_ref = try l.forward(ref, self.strm, .{ .prefill = prefill, .cached_k = &layer_cache.k, .cached_v = &layer_cache.v });
+            ref.deinit();
+            ref = next_ref;
+        }
+
+        try ref.rmsMut(self.norm, self.strm);
+
+        const ref_shape = try ref.shape();
+        const tokens_size = ref_shape[1];
+        const logits_size = ref_shape[2];
+        var logits = try ref.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ 1, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
+        defer logits.deinit();
+
+        var projection = try self.embedding_weights.transpose(self.strm);
+        defer projection.deinit();
+
+        try logits.matMulMut(projection, self.strm);
+
+        // const id_tensor = try logits.argmax(-1, self.strm);
+        const id_tensor = blk: {
+            if (self.pipeline_generation_config.greedy_sample) {
+                break :blk try logits.argmax(-1, self.strm);
+            } else {
+                // TODO: repetition penalty
+                var temp = Tensor.scalar(self.pipeline_generation_config.generation_config.temperature);
+                defer temp.deinit();
+                try logits.divMut(temp, self.strm);
+                // TODO: top-k and top-p sampling
+                break :blk try logits.categorical(-1, self.strm);
+            }
+        };
+
+        const id = try id_tensor.itemU32();
+        if (id == 151645 or id == 151643) return null;
+
+        return id_tensor;
+    }
+
+    fn emitToken(self: Self, token_tensor: Tensor, output: *Queue([]const u8)) !void {
+        const id = try token_tensor.itemU32();
+        const token = try self.tokenizer.decode(self.gpa, &[1]u32{id});
+        errdefer self.gpa.free(token);
+        _ = try output.put(self.io, &[1][]const u8{token}, 1);
     }
 
     pub fn callStreaming(self: Self, input: []const u8, output: *Queue([]const u8)) !void {
@@ -71,65 +144,15 @@ pub const Pipeline = struct {
 
         log.debug("encoded prompt into token IDs (dimensions={any})", .{encoded_input.shape()});
 
-        var first_pass = true;
+        var token_tensor = try self.forward(encoded_input, true) orelse return;
+        defer token_tensor.deinit();
+        try self.emitToken(token_tensor, output);
         while (true) {
-            defer first_pass = false;
-            var ref = try self.embedding_weights.take(encoded_input, 0, self.strm);
-            defer ref.deinit();
+            const output_token_tensor = try self.forward(token_tensor, false) orelse break;
+            try self.emitToken(output_token_tensor, output);
 
-            if (first_pass)
-                log.debug("looked up token embeddings (dimensions={any})", .{ref.shape()});
-
-            for (self.transformer_layers.items) |*l| {
-                const next_ref = try mlx.nn.Layer.forward(l, ref, self.strm);
-                ref.deinit();
-                ref = next_ref;
-            }
-
-            if (first_pass)
-                log.debug("computed hidden states through {d} transformer layers (dimensions={any})", .{ self.transformer_layers.items.len, ref.shape() });
-
-            try ref.rmsMut(self.norm, self.strm);
-
-            if (first_pass)
-                log.debug("applied final RMS normalization to hidden states (dimensions={any})", .{ref.shape()});
-
-            const ref_shape = try ref.shape();
-            const tokens_size = ref_shape[1];
-            const logits_size = ref_shape[2];
-            var logits = try ref.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ 1, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
-            defer logits.deinit();
-
-            if (first_pass)
-                log.debug("selected the last token position's hidden state (dimensions={any})", .{logits.shape()});
-
-            var projection = try self.embedding_weights.transpose(self.strm);
-            defer projection.deinit();
-
-            try logits.matMulMut(projection, self.strm);
-
-            if (first_pass)
-                log.debug("projected the last hidden state into vocabulary logits (dimensions={any})", .{logits.shape()});
-
-            var id_tensor = try logits.argmax(-1, self.strm);
-            defer id_tensor.deinit();
-
-            const id = try id_tensor.itemU32();
-
-            const token = try self.tokenizer.decode(self.gpa, &[1]u32{id});
-            errdefer self.gpa.free(token);
-
-            if (first_pass)
-                log.debug("selected the next token ID with argmax (dimensions={any}, id={d}, text={s})", .{ id_tensor.shape(), id, token });
-
-            if (id == 151645 or id == 151643) break;
-
-            try encoded_input.concatMut(id_tensor, -1, self.strm);
-
-            if (first_pass)
-                log.debug("appended the generated token ID to the input sequence (dimensions={any})", .{encoded_input.shape()});
-
-            _ = try output.put(self.io, &[1][]const u8{token}, 1);
+            token_tensor.deinit();
+            token_tensor = output_token_tensor;
         }
     }
 
@@ -169,6 +192,11 @@ pub const Pipeline = struct {
         self.embedding_weights.deinit();
         self.tokenizer.deinit();
         self.chat_template.deinit();
+        for (self.kv_cache.items) |*tensor| {
+            if (tensor.k) |*k| k.deinit();
+            if (tensor.v) |*v| v.deinit();
+        }
+        self.kv_cache.deinit(self.gpa);
     }
 };
 
@@ -281,6 +309,11 @@ pub const Handler = struct {
         var tokenizer = try Tokenizer.fromFile(ctx, info.tokenizer_file_path);
         errdefer tokenizer.deinit();
 
+        var kv_cache: std.ArrayList(KVCachePair) = try .initCapacity(ctx.gpa, config.num_hidden_layers);
+        for (0..config.num_hidden_layers) |_| {
+            try kv_cache.append(ctx.gpa, .{});
+        }
+
         return .{
             .gpa = ctx.gpa,
             .io = ctx.io,
@@ -290,6 +323,8 @@ pub const Handler = struct {
             .norm = norm,
             .embedding_weights = embedding_weights,
             .chat_template = try getChatTemplate(ctx, info.tokenizer_config_file_path),
+            .pipeline_generation_config = .{ .generation_config = info.generation_config.value },
+            .kv_cache = kv_cache,
         };
     }
 };

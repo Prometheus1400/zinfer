@@ -1,6 +1,6 @@
 const c = @import("mlx_c");
-const std = @import("std");
 const common = @import("common.zig");
+const std = @import("std");
 
 const log = std.log.scoped(.mlx);
 
@@ -8,7 +8,7 @@ pub const InitOptions = struct {
     require_gpu: bool = false,
 };
 
-pub fn init(opts: InitOptions) !MlxStream {
+pub fn init(opts: InitOptions) !Stream {
     var gpu_available = false;
     try common.check(c.mlx_metal_is_available(&gpu_available));
 
@@ -26,7 +26,7 @@ pub fn init(opts: InitOptions) !MlxStream {
     return .{ .p = strm };
 }
 
-pub const MlxStream = struct {
+pub const Stream = struct {
     const Self = @This();
 
     p: c.mlx_stream,

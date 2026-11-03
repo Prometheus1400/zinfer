@@ -1,12 +1,13 @@
-pub const Tensor = @import("tensor.zig").Tensor;
-pub const DType = @import("dtype.zig").DType;
-pub const Stream = @import("stream.zig").MlxStream;
-pub const InitOptions = @import("stream.zig").InitOptions;
-pub const init = @import("stream.zig").init;
-pub const Map = @import("map.zig").Map;
-
 pub const io = @import("io.zig");
 pub const nn = @import("nn/root.zig");
+
+pub const init = @import("stream.zig").init;
+
+pub const DType = @import("dtype.zig").DType;
+pub const InitOptions = @import("stream.zig").InitOptions;
+pub const Map = @import("map.zig").Map;
+pub const Stream = @import("stream.zig").Stream;
+pub const Tensor = @import("tensor.zig").Tensor;
 
 test "clone survives replacing and freeing the original handle" {
     const std = @import("std");
@@ -111,6 +112,51 @@ test "softmax normalizes each row with large scores" {
             try std.testing.expectApproxEqAbs(want, got, 1e-5);
         }
     }
+}
+
+test "categorical samples logits respects masking and removes the selected axis" {
+    const std = @import("std");
+    const c = @import("mlx_c");
+    const common = @import("common.zig");
+    const build_options = @import("build_options");
+    var strm = try init(.{ .require_gpu = build_options.metal });
+    defer strm.deinit();
+    const blocked = -std.math.inf(f32);
+
+    // The sample owns its handle and retains its input's lazy dependencies.
+    var sample = blk: {
+        var logits = try Tensor.fromSlice(f32, &.{ blocked, blocked, 0 }, &.{ 1, 1, 3 });
+        defer logits.deinit();
+        break :blk try logits.categorical(-1, strm);
+    };
+    defer sample.deinit();
+    try std.testing.expectEqualSlices(c_int, &.{ 1, 1 }, try sample.shape());
+    try std.testing.expectEqual(DType.uint32, try sample.dtype());
+    try std.testing.expectEqual(@as(u32, 2), try sample.itemU32());
+
+    // Sampling a different axis must remove that axis and honor each column's mask.
+    var columns = try Tensor.fromSlice(f32, &.{ blocked, 0, blocked, 0, blocked, 0 }, &.{ 2, 3 });
+    defer columns.deinit();
+    var column_samples = try columns.categorical(0, strm);
+    defer column_samples.deinit();
+    try std.testing.expectEqualSlices(c_int, &.{3}, try column_samples.shape());
+    try column_samples.eval();
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0, 1 }, c.mlx_array_data_uint32(column_samples.p)[0..3]);
+
+    // Equal logits allow both categories; argmax would always pick the first.
+    try common.check(c.mlx_random_seed(0));
+    const equal_logits: [256]f32 = @splat(0);
+    var rows = try Tensor.fromSlice(f32, &equal_logits, &.{ 128, 2 });
+    defer rows.deinit();
+    var row_samples = try rows.categorical(-1, strm);
+    defer row_samples.deinit();
+    try row_samples.eval();
+    var counts = [_]usize{ 0, 0 };
+    for (c.mlx_array_data_uint32(row_samples.p)[0..128]) |id| {
+        try std.testing.expect(id < 2);
+        counts[id] += 1;
+    }
+    try std.testing.expect(counts[0] > 0 and counts[1] > 0);
 }
 
 test "RoPE matches split-half rotations at zero and nonzero offsets" {

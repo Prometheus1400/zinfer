@@ -1,6 +1,7 @@
 const mlx = @import("mlx");
-const tok = @import("tokenizers_c");
 const std = @import("std");
+const tok = @import("tokenizers_c");
+
 const Context = @import("context.zig").Context;
 
 pub const Tokenizer = struct {

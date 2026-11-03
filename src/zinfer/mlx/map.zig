@@ -1,6 +1,7 @@
-const std = @import("std");
 const c = @import("mlx_c");
 const common = @import("common.zig");
+const std = @import("std");
+
 const Tensor = @import("tensor.zig").Tensor;
 
 pub const MapValueType = enum {

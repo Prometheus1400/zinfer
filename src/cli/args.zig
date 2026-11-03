@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const log = std.log.scoped(.args);
 
 pub const InspectArgs = struct {

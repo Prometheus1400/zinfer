@@ -1,7 +1,8 @@
 const c = @import("mlx_c");
 const common = @import("common.zig");
-const Stream = @import("stream.zig").MlxStream;
+
 const Map = @import("map.zig").Map;
+const Stream = @import("stream.zig").Stream;
 
 pub fn loadSafetensors(strm: Stream, path: []const u8) !struct { Map(.string), Map(.tensor) } {
     try common.ensure(.{strm});

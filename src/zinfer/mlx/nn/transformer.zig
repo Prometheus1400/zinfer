@@ -1,12 +1,21 @@
-const std = @import("std");
 const c = @import("mlx_c");
 const common = @import("../common.zig");
-const Tensor = @import("../tensor.zig").Tensor;
-const Map = @import("../map.zig").Map;
-const MlxStream = @import("../stream.zig").MlxStream;
-const Layer = @import("layer.zig");
-const SwiGluBlock = @import("swiglu.zig").SwiGluBlock;
+const std = @import("std");
+
 const loadWeight = @import("weights.zig").load;
+
+const Map = @import("../map.zig").Map;
+const Stream = @import("../stream.zig").Stream;
+const SwiGluBlock = @import("swiglu.zig").SwiGluBlock;
+const Tensor = @import("../tensor.zig").Tensor;
+
+const log = std.log.scoped(.transformer);
+
+pub const AttentionContext = struct {
+    prefill: bool,
+    cached_k: *?Tensor,
+    cached_v: *?Tensor,
+};
 
 pub const TransformerBlock = struct {
     const Self = @This();
@@ -37,25 +46,30 @@ pub const TransformerBlock = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        Layer.deinit(&self.attention);
-        Layer.deinit(&self.mlp);
+        self.attention.deinit();
+        self.mlp.deinit();
         self.input_layernorm_w.deinit();
         self.post_attention_layernorm_w.deinit();
     }
 
-    pub fn forward(self: *Self, x: Tensor, strm: MlxStream) !Tensor {
+    pub fn forward(self: *Self, x: Tensor, strm: Stream, options: AttentionContext) !Tensor {
         var rms_1 = try Tensor.rms(x, self.input_layernorm_w, strm);
         defer rms_1.deinit();
-        var attention_output = try Layer.forward(&self.attention, rms_1, strm);
+
+        var attention_output = try self.attention.forward(rms_1, strm, options);
         defer attention_output.deinit();
+
         var h = try Tensor.add(attention_output, x, strm);
         defer h.deinit();
 
         var rms_2 = try Tensor.rms(h, self.post_attention_layernorm_w, strm);
         defer rms_2.deinit();
-        var mlp_output = try Layer.forward(&self.mlp, rms_2, strm);
+
+        var mlp_output = try self.mlp.forward(rms_2, strm);
         defer mlp_output.deinit();
-        return Tensor.add(mlp_output, h, strm);
+
+        const output = try Tensor.add(mlp_output, h, strm);
+        return output;
     }
 };
 
@@ -125,9 +139,17 @@ pub const AttentionBlock = struct {
         self.o_proj_w.deinit();
     }
 
-    pub fn forward(self: *Self, x: Tensor, strm: MlxStream) !Tensor {
+    pub fn forward(self: *Self, x: Tensor, strm: Stream, options: AttentionContext) !Tensor {
+        if (options.prefill and (options.cached_k.* != null or options.cached_v.* != null)) {
+            return error.InconsistentForwardOptions;
+        }
+        if (!options.prefill and try x.dim(1) != 1) {
+            return error.DecodingWithMoreThanOneInputToken;
+        }
+
         const input_shape = try x.shape();
 
+        // TODO: do this once on init and resuse the transposed handles (unsure if this will improve perf)
         var q_w_tran = try self.q_w.transpose(strm);
         defer q_w_tran.deinit();
         var k_w_tran = try self.k_w.transpose(strm);
@@ -145,6 +167,21 @@ pub const AttentionBlock = struct {
         defer v.deinit();
         try v.addMut(self.v_bias, strm);
 
+        var resolved_k: Tensor = undefined;
+        var resolved_v: Tensor = undefined;
+        if (options.prefill) {
+            options.cached_k.* = try k.clone();
+            options.cached_v.* = try v.clone();
+            resolved_k = k;
+            resolved_v = v;
+        } else {
+            try options.cached_k.*.?.concatMut(k, 1, strm);
+            try options.cached_v.*.?.concatMut(v, 1, strm);
+            resolved_k = options.cached_k.*.?;
+            resolved_v = options.cached_v.*.?;
+        }
+        const kv_shape = try resolved_k.shape();
+
         const new_q_shape = [_]c_int{
             input_shape[0], // batch
             input_shape[1], // tokens
@@ -153,23 +190,26 @@ pub const AttentionBlock = struct {
         };
         var q_heads = try Tensor.reshape(q, &new_q_shape, strm);
         defer q_heads.deinit();
-        try q_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
-        const head_size: c_int = @intCast(try q_heads.dim(3));
-        try q_heads.ropeMut(head_size, self.rope_theta, 0, strm);
-        const q_heads_shape = try q_heads.shape();
 
+        try q_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
+
+        const head_size: c_int = @intCast(try q_heads.dim(3));
+        const query_offset = kv_shape[1] - input_shape[1];
+        try q_heads.ropeMut(head_size, self.rope_theta, query_offset, strm);
+
+        const q_heads_shape = try q_heads.shape();
         const new_kv_shape = [_]c_int{
-            input_shape[0], // batch
-            input_shape[1], // tokens
+            kv_shape[0], // batch
+            kv_shape[1], // tokens
             @intCast(self.num_key_value_heads), // heads
             -1, // infer head dimension: 64
         };
-        var k_heads = try Tensor.reshape(k, &new_kv_shape, strm);
+        var k_heads = try Tensor.reshape(resolved_k, &new_kv_shape, strm);
         defer k_heads.deinit();
         try k_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
         try k_heads.ropeMut(head_size, self.rope_theta, 0, strm);
 
-        var v_heads = try Tensor.reshape(v, &new_kv_shape, strm);
+        var v_heads = try Tensor.reshape(resolved_v, &new_kv_shape, strm);
         defer v_heads.deinit();
         try v_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
 
@@ -223,7 +263,6 @@ pub const AttentionBlock = struct {
             try q_head.matMulMut(k_head_t, strm);
             try q_head.divMut(scale, strm);
             try q_head.addMut(mask, strm);
-
             try q_head.softmaxMut(-1, strm);
             try q_head.matMulMut(v_head, strm);
 
@@ -245,7 +284,7 @@ pub const AttentionBlock = struct {
 };
 
 // Zeros on and below the diagonal; negative infinity above it.
-fn causalMask(token_count: c_int, strm: MlxStream) !Tensor {
+fn causalMask(token_count: c_int, strm: Stream) !Tensor {
     try common.ensure(.{strm});
 
     var blocked = Tensor.scalar(-std.math.inf(f32));
