@@ -121,13 +121,14 @@ pub const Handler = struct {
         return .init(ctx.gpa, tokenizer_config.value.chat_template);
     }
 
+    // TODO: Apply max_new_tokens and kv_caching_strategy from pipeline_args to the returned pipeline.
     // zig fmt: off
     pub fn buildPipeline(
         ctx: Context, 
         info: *const models.ModelInfo,
         pipeline_args: struct {
+            /// Zero selects greedy decoding; positive values scale logits before sampling.
             temperature: f32 = 0.7,
-            deterministic_generation: bool = false, 
             max_new_tokens: u32 = 512,
             kv_caching_strategy: enum {
                 none,
@@ -202,7 +203,6 @@ const KVCachePair = struct {
 const PipelineGenerationConfig = struct {
     generation_config: models.GenerationConfig,
     enable_kv_cache: bool = true,
-    greedy_sample: bool = false,
 };
 
 pub const Pipeline = struct {
@@ -222,7 +222,6 @@ pub const Pipeline = struct {
     stop_tokens: []const u32,
     temperature: f32,
     max_new_tokens: u32 = 512,
-    greedy_sample: bool = false,
 
     /// Applies the chat template and tokenizes
     fn preprocess(self: Self, input: []const u8) !Tensor {
@@ -269,14 +268,14 @@ pub const Pipeline = struct {
         defer token_ids.deinit();
 
         var id_tensor = blk: {
-            // Greedy decoding selects the highest-scoring token deterministically.
-            if (self.greedy_sample) {
+            if (self.temperature == 0) {
+                // Greedy decoding selects the highest-scoring token deterministically.
                 break :blk try token_ids.argmax(-1, self.strm);
             } else {
                 // TODO: repetition penalty
                 var temp = Tensor.scalar(self.temperature);
                 defer temp.deinit();
-                try logits.divMut(temp, self.strm);
+                try token_ids.divMut(temp, self.strm);
                 // TODO: top-k and top-p sampling
                 break :blk try token_ids.categorical(-1, self.strm);
             }
