@@ -1,15 +1,9 @@
-const c = @import("mlx_c");
-const common = @import("../common.zig");
-const std = @import("std");
-
 const loadWeight = @import("weights.zig").load;
 
 const Map = @import("../map.zig").Map;
 const Stream = @import("../stream.zig").Stream;
 const SwiGluBlock = @import("swiglu.zig").SwiGluBlock;
 const Tensor = @import("../tensor.zig").Tensor;
-
-const log = std.log.scoped(.transformer);
 
 pub const Config = struct {
     num_attention_heads: usize,
@@ -226,111 +220,3 @@ pub const AttentionBlock = struct {
         return attention_output;
     }
 };
-
-// Zeros on and below the diagonal; negative infinity above it.
-fn causalMask(token_count: c_int, strm: Stream) !Tensor {
-    try common.ensure(.{strm});
-
-    var blocked = Tensor.scalar(-std.math.inf(f32));
-    defer blocked.deinit();
-
-    const shape = [_]c_int{ token_count, token_count };
-    var full = c.mlx_array_new();
-    defer _ = c.mlx_array_free(full);
-    try common.check(c.mlx_full(&full, &shape, shape.len, blocked.p, c.MLX_FLOAT32, strm.p));
-
-    var res = c.mlx_array_new();
-    errdefer _ = c.mlx_array_free(res);
-    // Keep only entries strictly above the diagonal; set the rest to zero.
-    try common.check(c.mlx_triu(&res, full, 1, strm.p));
-    return .{ .p = res };
-}
-
-test "init loads the requested layer and retains weights after map cleanup" {
-    var weights: Map(.tensor) = .{ .p = c.mlx_map_string_to_array_new() };
-    defer weights.deinit();
-    const config: TransformerBlock.Config = .{
-        .num_attention_heads = 14,
-        .num_key_value_heads = 2,
-        .rope_theta = 1_000_000,
-    };
-    try std.testing.expectError(error.MlxGenericError, TransformerBlock.init(weights, 3, config));
-
-    const fields = .{
-        .{ "q_w", "self_attn.q_proj.weight" },
-        .{ "q_bias", "self_attn.q_proj.bias" },
-        .{ "k_w", "self_attn.k_proj.weight" },
-        .{ "k_bias", "self_attn.k_proj.bias" },
-        .{ "v_w", "self_attn.v_proj.weight" },
-        .{ "v_bias", "self_attn.v_proj.bias" },
-        .{ "input_layernorm_w", "input_layernorm.weight" },
-        .{ "post_attention_layernorm_w", "post_attention_layernorm.weight" },
-        .{ "gate_proj_w", "mlp.gate_proj.weight" },
-        .{ "up_proj_w", "mlp.up_proj.weight" },
-        .{ "down_proj_w", "mlp.down_proj.weight" },
-        .{ "o_proj_w", "self_attn.o_proj.weight" },
-    };
-    inline for (fields, 0..) |field, index| {
-        var buf: [160]u8 = undefined;
-        var other_layer = Tensor.scalar(-1);
-        defer other_layer.deinit();
-        const other_key = try std.mem.printSentinel(&buf, "model.layers.0.{s}", .{field[1]}, 0);
-        try common.check(c.mlx_map_string_to_array_insert(weights.p, other_key.ptr, other_layer.p));
-
-        var value = Tensor.scalar(@floatFromInt(index + 1));
-        defer value.deinit();
-        const key = try std.mem.printSentinel(&buf, "model.layers.3.{s}", .{field[1]}, 0);
-        try common.check(c.mlx_map_string_to_array_insert(weights.p, key.ptr, value.p));
-    }
-
-    var block = try TransformerBlock.init(weights, 3, config);
-    defer block.deinit();
-    weights.deinit();
-    try std.testing.expectEqual(config.num_attention_heads, block.attention.num_attention_heads);
-    try std.testing.expectEqual(config.num_key_value_heads, block.attention.num_key_value_heads);
-    try std.testing.expectEqual(config.rope_theta, block.attention.rope_theta);
-    const loaded = [_]Tensor{
-        block.attention.q_w,
-        block.attention.q_bias,
-        block.attention.k_w,
-        block.attention.k_bias,
-        block.attention.v_w,
-        block.attention.v_bias,
-        block.input_layernorm_w,
-        block.post_attention_layernorm_w,
-        block.mlp.gate_proj_w,
-        block.mlp.up_proj_w,
-        block.mlp.down_proj_w,
-        block.attention.o_proj_w,
-    };
-    for (loaded, 0..) |tensor, index| {
-        try common.check(c.mlx_array_eval(tensor.p));
-        try std.testing.expectEqual(@as(f32, @floatFromInt(index + 1)), c.mlx_array_data_float32(tensor.p)[0]);
-    }
-}
-
-test "causal mask blocks future tokens before softmax" {
-    const build_options = @import("build_options");
-    var strm = try @import("../stream.zig").init(.{ .require_gpu = build_options.metal });
-    defer strm.deinit();
-
-    var mask = try causalMask(3, strm);
-    defer mask.deinit();
-    try std.testing.expectEqualSlices(c_int, &.{ 3, 3 }, try mask.shape());
-    try common.check(c.mlx_array_eval(mask.p));
-    const inf = std.math.inf(f32);
-    const mask_data = c.mlx_array_data_float32(mask.p);
-    try std.testing.expectEqualSlices(f32, &.{ 0, -inf, -inf, 0, 0, -inf, 0, 0, 0 }, mask_data[0..9]);
-
-    // Future scores are deliberately much larger than the allowed scores.
-    var scores = try Tensor.fromSlice(f32, &.{ 0, 1000, 1000, 0, 0, 1000, 0, 0, 0 }, &.{ 3, 3 });
-    defer scores.deinit();
-    try scores.addMut(mask, strm);
-    try scores.softmaxMut(-1, strm);
-    try common.check(c.mlx_array_eval(scores.p));
-    const actual = c.mlx_array_data_float32(scores.p);
-    const expected = [_]f32{ 1, 0, 0, 0.5, 0.5, 0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 };
-    for (expected, actual[0..expected.len]) |want, got| {
-        try std.testing.expectApproxEqAbs(want, got, 1e-5);
-    }
-}

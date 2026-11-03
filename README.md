@@ -37,7 +37,6 @@ zig build native      # build all native dependencies
 zig build tokenizers  # build only the tokenizer C library
 zig build minijinja   # build only the MiniJinja C library
 zig build bindings    # translate only the C headers
-zig build test-chat-template # test the wrapper and local Qwen chat template
 ```
 
 Options: `-Dmetal=false`, `-Dnative-jobs=2` (default: 4), and
@@ -64,7 +63,7 @@ zig build run -Dlog-level=info -- prompt --model qwen -p hi
   separate lock using upstream's Cargo lockfile.
 - `src/zinfer/root.zig`: the public runtime API, imported with `@import("zinfer")`.
 - `src/zinfer/models/`: shared model loading and the Qwen implementation.
-- `src/zinfer/chat_template.zig`: the owning `ChatTemplate` wrapper and its tests.
+- `src/zinfer/chat_template.zig`: the owning `ChatTemplate` wrapper.
 - `src/zinfer/mlx/headers.h`: the single translation unit including `mlx/c/mlx.h`.
 - `src/cli/`: command-line argument parsing and the executable entry point.
 - `vendor/mlx-c`: unmodified upstream submodule.

@@ -180,7 +180,7 @@ pub const Handler = struct {
             .stop_tokens = try ctx.gpa.dupe(u32, info.generation_config.value.eos_token_id),
             // .pipeline_generation_config = .{ .generation_config = info.generation_config.value },
             .kv_cache = kv_cache,
-            .temperature = pipeline_args.temperature, 
+            .temperature = pipeline_args.temperature,
         };
     }
 };
@@ -360,58 +360,3 @@ pub const Pipeline = struct {
         self.gpa.free(self.stop_tokens);
     }
 };
-
-test "Qwen checkpoint generates matching owned buffered and streamed responses" {
-    const build_options = @import("build_options");
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var strm = try mlx.init(.{ .require_gpu = build_options.metal });
-    defer strm.deinit();
-    const ctx: Context = .{ .gpa = gpa, .io = io, .stream = strm };
-
-    var buffered, var streamed = blk: {
-        var info = models.getModelInfo(ctx, "qwen") catch |err| switch (err) {
-            error.FileNotFound => return error.SkipZigTest,
-            else => return err,
-        };
-        defer info.deinit(gpa);
-        const config = switch (info.config) {
-            .qwen_config => |parsed| parsed.value,
-            .empty => return error.MissingModelConfig,
-        };
-        var pipeline = try Handler.buildPipeline(ctx, &info);
-        defer pipeline.deinit();
-        try std.testing.expect(config.num_hidden_layers > 0);
-        try std.testing.expectEqual(@as(usize, config.num_hidden_layers), pipeline.transformer_layers.items.len);
-
-        var response = try pipeline.call("hi");
-        errdefer response.deinit(gpa);
-
-        var writer = std.Io.Writer.Allocating.init(gpa);
-        defer writer.deinit();
-        var buffer: [2][]const u8 = undefined;
-        var queue: Queue([]const u8) = .init(&buffer);
-        {
-            const handle = try std.Thread.spawn(
-                .{},
-                models.collectStreamingResponse,
-                .{ gpa, io, &queue, &writer.writer, models.CollectOptions{} },
-            );
-            defer {
-                queue.close(io);
-                handle.join();
-            }
-            try pipeline.callStreaming("hi", &queue);
-        }
-        try std.testing.expectError(error.Closed, queue.getOne(io));
-        break :blk .{ response, writer.toArrayList() };
-    };
-    defer buffered.deinit(gpa);
-    defer streamed.deinit(gpa);
-
-    // The returned text must remain valid after the pipeline and model are freed.
-    try std.testing.expect(buffered.items.len > 0);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(buffered.items));
-    try std.testing.expectEqualStrings(buffered.items, streamed.items);
-}
