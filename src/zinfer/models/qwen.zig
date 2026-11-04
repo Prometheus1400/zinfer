@@ -3,6 +3,8 @@ const models = @import("root.zig");
 const std = @import("std");
 const template = @import("chat_template");
 
+const cache = mlx.nn.cache;
+
 const ChatTemplate = template.ChatTemplate;
 const Context = @import("../context.zig").Context;
 const Queue = std.Io.Queue;
@@ -164,9 +166,9 @@ pub const Handler = struct {
         var tokenizer = try Tokenizer.fromFile(ctx, info.tokenizer_file_path);
         errdefer tokenizer.deinit();
 
-        var kv_cache: std.ArrayList(KVCachePair) = try .initCapacity(ctx.gpa, config.num_hidden_layers);
+        var kv_cache: std.ArrayList(cache.ContiguousKVCache) = try .initCapacity(ctx.gpa, config.num_hidden_layers);
         for (0..config.num_hidden_layers) |_| {
-            try kv_cache.append(ctx.gpa, .{});
+            try kv_cache.append(ctx.gpa, .{ .strm = ctx.stream });
         }
 
         return .{
@@ -197,11 +199,6 @@ const TokenizerConfig = struct {
 };
 // zig fmt: on
 
-const KVCachePair = struct {
-    k: ?Tensor = null,
-    v: ?Tensor = null,
-};
-
 pub const Pipeline = struct {
     const Self = @This();
 
@@ -214,7 +211,7 @@ pub const Pipeline = struct {
     embedding_weights: Tensor,
     chat_template: ChatTemplate,
 
-    kv_cache: std.ArrayList(KVCachePair),
+    kv_cache: std.ArrayList(cache.ContiguousKVCache),
     stop_tokens: []const u32,
     temperature: f32,
     max_new_tokens: u32 = 512,
@@ -230,9 +227,8 @@ pub const Pipeline = struct {
         self.embedding_weights.deinit();
         self.tokenizer.deinit();
         self.chat_template.deinit();
-        for (self.kv_cache.items) |*tensor| {
-            if (tensor.k) |*k| k.deinit();
-            if (tensor.v) |*v| v.deinit();
+        for (self.kv_cache.items) |*c| {
+            c.deinit();
         }
         self.kv_cache.deinit(self.gpa);
         self.gpa.free(self.stop_tokens);
@@ -258,7 +254,7 @@ pub const Pipeline = struct {
         // Pass the hidden vectors through each transformer layer, updating its KV cache.
         for (self.transformer_layers.items, 0..) |*l, i| {
             const layer_cache = &self.kv_cache.items[i];
-            const transformer_layer_output = try l.forward(x, self.strm, .{ .prefill = options.prefill, .cached_k = &layer_cache.k, .cached_v = &layer_cache.v });
+            const transformer_layer_output = try l.forward(x, self.strm, .{ .prefill = options.prefill, .kv_cache = layer_cache });
             x.deinit();
             x = transformer_layer_output;
         }

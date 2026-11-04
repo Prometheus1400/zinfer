@@ -4,6 +4,7 @@ const Map = @import("../map.zig").Map;
 const Stream = @import("../stream.zig").Stream;
 const SwiGluBlock = @import("swiglu.zig").SwiGluBlock;
 const Tensor = @import("../tensor.zig").Tensor;
+const ContiguousKVCache = @import("cache.zig").ContiguousKVCache;
 
 pub const Config = struct {
     num_attention_heads: usize,
@@ -13,8 +14,7 @@ pub const Config = struct {
 
 pub const AttentionContext = struct {
     prefill: bool,
-    cached_k: *?Tensor,
-    cached_v: *?Tensor,
+    kv_cache: *ContiguousKVCache,
 };
 
 pub const TransformerBlock = struct {
@@ -132,9 +132,10 @@ pub const AttentionBlock = struct {
     }
 
     pub fn forward(self: *Self, x: Tensor, strm: Stream, options: AttentionContext) !Tensor {
-        if ((options.cached_k.* == null and options.cached_v.* != null) or (options.cached_k.* != null and options.cached_v.* == null)) {
-            return error.InconsistentForwardOptions;
-        }
+        // if ((options.cached_k.* == null and options.cached_v.* != null) or (options.cached_k.* != null and options.cached_v.* == null)) {
+        //     return error.InconsistentForwardOptions;
+        // }
+        const cache = options.kv_cache;
 
         const input_shape = try x.shape();
 
@@ -168,10 +169,8 @@ pub const AttentionBlock = struct {
         try q_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
 
         const head_size: c_int = @intCast(try q_heads.dim(3));
-        const offset: c_int = if (options.cached_k.*) |*cached_k|
-            @intCast(try cached_k.dim(2))
-        else
-            0;
+        const offset: c_int = @intCast(cache.len);
+
         try q_heads.ropeMut(head_size, self.rope_theta, offset, strm);
 
         const kv_shape = try k.shape();
@@ -194,17 +193,15 @@ pub const AttentionBlock = struct {
 
         var resolved_k: Tensor = undefined;
         var resolved_v: Tensor = undefined;
-        if (options.prefill and options.cached_k.* == null and options.cached_v.* == null) {
-            options.cached_k.* = try k_heads.clone();
-            options.cached_v.* = try v_heads.clone();
+        if (options.prefill and cache.len == 0) {
             resolved_k = k_heads;
             resolved_v = v_heads;
         } else {
-            try options.cached_k.*.?.concatMut(k_heads, 2, strm);
-            try options.cached_v.*.?.concatMut(v_heads, 2, strm);
-            resolved_k = options.cached_k.*.?;
-            resolved_v = options.cached_v.*.?;
+            const kv = try cache.get();
+            resolved_k = try kv.k.concat(k_heads, 2, strm);
+            resolved_v = try kv.v.concat(v_heads, 2, strm);
         }
+        try cache.append(.{ .k = k_heads, .v = v_heads });
 
         var attention_output = try Tensor.scaledDotProductAttention(q_heads, resolved_k, resolved_v, 1 / @sqrt(@as(f32, @floatFromInt(head_size))), .causal, strm);
         errdefer attention_output.deinit();
