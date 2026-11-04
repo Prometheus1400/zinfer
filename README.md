@@ -33,11 +33,19 @@ and the `json` feature for Jinja's `tojson` filter. The submodule stays unchange
 git submodule update --init --recursive
 zig build             # build and install into zig-out/
 zig build run -- inspect --model qwen
+zig build run -- prompt --model qwen -p "Hello!" --stream
+zig build run -- chat --model qwen
 zig build native      # build all native dependencies
 zig build tokenizers  # build only the tokenizer C library
 zig build minijinja   # build only the MiniJinja C library
 zig build bindings    # translate only the C headers
 ```
+
+The `prompt` command generates a single response; `--stream` prints it as it is
+generated. The `chat` command starts an interactive session: type a message at
+the `>` prompt and press Enter. Replies stream automatically, and the model
+stays loaded with its KV cache retained between turns. Press Ctrl+D at an empty
+prompt to exit, or Ctrl+C to interrupt.
 
 Options: `-Dmetal=false`, `-Dnative-jobs=2` (default: 4), and
 `-Doptimize=ReleaseFast`. Native libraries always build in Release mode.
@@ -47,41 +55,13 @@ including runtime library logs. The default is `debug` in Debug builds and
 `info` in release builds. For example:
 
 ```sh
-zig build run -Dlog-level=info -- prompt --model qwen -p hi
+zig build run -Dlog-level=info -- chat --model qwen
 ```
-
-## Layout
-
-- `build.zig`: native build orchestration, C translation, linking, and installation.
-- `cmake/build-mlx.cmake`: serializes native configuration and compilation so
-  editor background builds and terminal builds can share the cache safely.
-- `cmake/build-tokenizers.cmake`: builds the Rust tokenizer C library under a
-  separate lock. Generated `@import("tokenizers_c")` bindings and static linking
-  are available inside the runtime module.
-- `cmake/tokenizers.h`: the translation unit including `tokenizers_c.h`.
-- `cmake/build-minijinja.cmake`: builds the static MiniJinja C library under a
-  separate lock using upstream's Cargo lockfile.
-- `src/zinfer/root.zig`: the public runtime API, imported with `@import("zinfer")`.
-- `src/zinfer/models/`: shared model loading and the Qwen implementation.
-- `src/zinfer/chat_template.zig`: the owning `ChatTemplate` wrapper.
-- `src/zinfer/mlx/headers.h`: the single translation unit including `mlx/c/mlx.h`.
-- `src/cli/`: command-line argument parsing and the executable entry point.
-- `vendor/mlx-c`: unmodified upstream submodule.
-- `vendor/tokenizers-cpp`: unmodified upstream tokenizer submodule.
-- `vendor/minijinja`: unmodified upstream template engine submodule.
-- `.zig-cache/native-mlx/{cpu,metal}`: separate incremental native build trees.
-- `.zig-cache/native-tokenizers`: copied crate sources and Cargo's incremental
-  native build artifacts.
-- `.zig-cache/native-minijinja`: Cargo's incremental MiniJinja build artifacts.
-- `zig-out/bin` and `zig-out/lib`: executable, shared libraries, and GPU
-  `mlx.metallib`. Keep these folders together when moving the installed output.
-
-Generated bindings and compiled dependencies are ignored by Git.
 
 ## Chat templates
 
 The Qwen pipeline loads the `chat_template` from `tokenizer_config.json` and
-renders it once before encoding the prompt, including the assistant prefix.
+renders it for each input before encoding, including the assistant prefix.
 The tokenizer and chat-template wrappers are internal to the runtime; the public
 `zinfer` module exports `mlx`, `Context`, and `models`.
 
