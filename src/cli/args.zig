@@ -12,9 +12,14 @@ pub const PromptArgs = struct {
     stream: bool = false,
 };
 
+pub const ChatArgs = struct {
+    model: []const u8 = "",
+};
+
 pub const Command = union(enum) {
     inspect: InspectArgs,
     prompt: PromptArgs,
+    chat: ChatArgs,
 };
 
 pub const Args = struct {
@@ -44,6 +49,8 @@ pub fn parseArgs(args: std.process.Args) !Args {
             ret.command = .{ .inspect = InspectArgs{} };
         } else if (std.mem.eql(u8, "prompt", arg) and i == 0) {
             ret.command = .{ .prompt = PromptArgs{} };
+        } else if (std.mem.eql(u8, "chat", arg) and i == 0) {
+            ret.command = .{ .chat = ChatArgs{} };
         }
 
         if (ret.command) |*c| {
@@ -65,6 +72,12 @@ pub fn parseArgs(args: std.process.Args) !Args {
                     }
                     if (std.mem.eql(u8, "--stream", arg) or std.mem.eql(u8, "-s", arg)) {
                         x.stream = true;
+                    }
+                },
+                .chat => |*x| {
+                    if (std.mem.eql(u8, "--model", arg) or std.mem.eql(u8, "-m", arg)) {
+                        const model_str = parsing_iter.next() orelse return error.NoModelProvided;
+                        x.model = model_str;
                     }
                 },
             }

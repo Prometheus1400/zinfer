@@ -129,7 +129,8 @@ pub const Handler = struct {
         pipeline_args: struct {
             /// Zero selects greedy decoding; positive values scale logits before sampling.
             temperature: f32 = 0.7,
-            max_new_tokens: u32 = 512,
+            repetition_penalty: f32 = 1.2,
+            max_new_tokens: u32 = 2048,
             kv_caching_strategy: enum {
                 none,
                 simple
@@ -181,6 +182,7 @@ pub const Handler = struct {
             // .pipeline_generation_config = .{ .generation_config = info.generation_config.value },
             .kv_cache = kv_cache,
             .temperature = pipeline_args.temperature,
+            .repetition_penalty = pipeline_args.repetition_penalty,
         };
     }
 };
@@ -200,11 +202,6 @@ const KVCachePair = struct {
     v: ?Tensor = null,
 };
 
-const PipelineGenerationConfig = struct {
-    generation_config: models.GenerationConfig,
-    enable_kv_cache: bool = true,
-};
-
 pub const Pipeline = struct {
     const Self = @This();
 
@@ -217,11 +214,29 @@ pub const Pipeline = struct {
     embedding_weights: Tensor,
     chat_template: ChatTemplate,
 
-    // pipeline_generation_config: PipelineGenerationConfig,
     kv_cache: std.ArrayList(KVCachePair),
     stop_tokens: []const u32,
     temperature: f32,
     max_new_tokens: u32 = 512,
+    repetition_penalty: f32,
+    needs_prefill: bool = true,
+
+    pub fn deinit(self: *Self) void {
+        for (self.transformer_layers.items) |*layer| {
+            layer.deinit();
+        }
+        self.transformer_layers.deinit(self.gpa);
+        self.norm.deinit();
+        self.embedding_weights.deinit();
+        self.tokenizer.deinit();
+        self.chat_template.deinit();
+        for (self.kv_cache.items) |*tensor| {
+            if (tensor.k) |*k| k.deinit();
+            if (tensor.v) |*v| v.deinit();
+        }
+        self.kv_cache.deinit(self.gpa);
+        self.gpa.free(self.stop_tokens);
+    }
 
     /// Applies the chat template and tokenizes
     fn preprocess(self: Self, input: []const u8) !Tensor {
@@ -235,7 +250,7 @@ pub const Pipeline = struct {
         return self.tokenizer.encode(initial_prompt);
     }
 
-    fn forward(self: Self, input: Tensor, prefill: bool) !?Tensor {
+    fn forward(self: Self, input: Tensor, options: struct { generated_tokens: *Tensor, prefill: bool }) !?Tensor {
         // Look up an embedding vector for each input token ID.
         var x = try self.embedding_weights.take(input, 0, self.strm);
         defer x.deinit();
@@ -243,7 +258,7 @@ pub const Pipeline = struct {
         // Pass the hidden vectors through each transformer layer, updating its KV cache.
         for (self.transformer_layers.items, 0..) |*l, i| {
             const layer_cache = &self.kv_cache.items[i];
-            const transformer_layer_output = try l.forward(x, self.strm, .{ .prefill = prefill, .cached_k = &layer_cache.k, .cached_v = &layer_cache.v });
+            const transformer_layer_output = try l.forward(x, self.strm, .{ .prefill = options.prefill, .cached_k = &layer_cache.k, .cached_v = &layer_cache.v });
             x.deinit();
             x = transformer_layer_output;
         }
@@ -257,29 +272,58 @@ pub const Pipeline = struct {
         const logits_size = ref_shape[2];
 
         // Select the last input position's hidden vector to predict the next token.
-        var logits = try x.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ 1, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
-        defer logits.deinit();
+        var last_hidden_state = try x.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ 1, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
+        defer last_hidden_state.deinit();
 
         var projection = try self.embedding_weights.transpose(self.strm);
         defer projection.deinit();
 
         // Project the hidden vector to vocabulary logits using the shared embedding weights.
-        var token_ids = try logits.matMul(projection, self.strm);
-        defer token_ids.deinit();
+        var next_token_logits = try last_hidden_state.matMul(projection, self.strm);
+        defer next_token_logits.deinit();
+
+        // repetition penalty
+        // zig fmt: off
+        var prev_gen_tokens_probs = try next_token_logits.gather(
+            &[_]Tensor{options.generated_tokens.*},
+            &[_]c_int{2},
+            &[_]c_int{1, 1, 1},
+            self.strm
+        );
+        // zig fmt: on
+        defer prev_gen_tokens_probs.deinit();
+
+        var penalty = Tensor.scalar(self.repetition_penalty);
+        defer penalty.deinit();
+        var positive_penalty_results = try prev_gen_tokens_probs.div(penalty, self.strm);
+        defer positive_penalty_results.deinit();
+        var negative_penalty_results = try prev_gen_tokens_probs.mul(penalty, self.strm);
+        defer negative_penalty_results.deinit();
+
+        const zeros = Tensor.scalar(0);
+        var mask = try prev_gen_tokens_probs.greaterEqual(zeros, self.strm);
+        defer mask.deinit();
+
+        var updated_prev_gen_tokens_probs = try Tensor.where(mask, positive_penalty_results, negative_penalty_results, self.strm);
+        defer updated_prev_gen_tokens_probs.deinit();
+
+        var penalty_applied_next_token_logits = try next_token_logits.scatter(&[_]Tensor{options.generated_tokens.*}, updated_prev_gen_tokens_probs, &[_]c_int{2}, self.strm);
+        defer penalty_applied_next_token_logits.deinit();
 
         var id_tensor = blk: {
             if (self.temperature == 0) {
                 // Greedy decoding selects the highest-scoring token deterministically.
-                break :blk try token_ids.argmax(-1, self.strm);
+                break :blk try penalty_applied_next_token_logits.argmax(-1, self.strm);
             } else {
-                // TODO: repetition penalty
                 var temp = Tensor.scalar(self.temperature);
                 defer temp.deinit();
-                try token_ids.divMut(temp, self.strm);
+                try penalty_applied_next_token_logits.divMut(temp, self.strm);
                 // TODO: top-k and top-p sampling
-                break :blk try token_ids.categorical(-1, self.strm);
+                break :blk try penalty_applied_next_token_logits.categorical(-1, self.strm);
             }
         };
+
+        try options.generated_tokens.concatMut(id_tensor, 1, self.strm);
 
         if (std.mem.findScalar(u32, self.stop_tokens, try id_tensor.itemU32()) != null) {
             defer id_tensor.deinit();
@@ -305,11 +349,15 @@ pub const Pipeline = struct {
 
         log.debug("encoded prompt into token IDs (dimensions={any})", .{encoded_input.shape()});
 
-        var token_tensor = try self.forward(encoded_input, true) orelse return;
+        var generated_tokens = try Tensor.zeros(&[_]c_int{ 1, 0 }, .int32, self.strm);
+        defer generated_tokens.deinit();
+
+        var token_tensor = try self.forward(encoded_input, .{ .generated_tokens = &generated_tokens, .prefill = true }) orelse return;
         defer token_tensor.deinit();
         try self.emitToken(token_tensor, output);
-        for (0..self.max_new_tokens) |_| {
-            const output_token_tensor = try self.forward(token_tensor, false) orelse return;
+
+        for (1..self.max_new_tokens) |_| {
+            const output_token_tensor = try self.forward(token_tensor, .{ .generated_tokens = &generated_tokens, .prefill = false }) orelse return;
             try self.emitToken(output_token_tensor, output);
 
             token_tensor.deinit();
@@ -341,22 +389,5 @@ pub const Pipeline = struct {
         }
 
         return writer.toArrayList();
-    }
-
-    pub fn deinit(self: *Self) void {
-        for (self.transformer_layers.items) |*layer| {
-            layer.deinit();
-        }
-        self.transformer_layers.deinit(self.gpa);
-        self.norm.deinit();
-        self.embedding_weights.deinit();
-        self.tokenizer.deinit();
-        self.chat_template.deinit();
-        for (self.kv_cache.items) |*tensor| {
-            if (tensor.k) |*k| k.deinit();
-            if (tensor.v) |*v| v.deinit();
-        }
-        self.kv_cache.deinit(self.gpa);
-        self.gpa.free(self.stop_tokens);
     }
 };

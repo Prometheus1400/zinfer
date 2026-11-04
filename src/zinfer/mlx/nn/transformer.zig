@@ -132,11 +132,8 @@ pub const AttentionBlock = struct {
     }
 
     pub fn forward(self: *Self, x: Tensor, strm: Stream, options: AttentionContext) !Tensor {
-        if (options.prefill and (options.cached_k.* != null or options.cached_v.* != null)) {
+        if ((options.cached_k.* == null and options.cached_v.* != null) or (options.cached_k.* != null and options.cached_v.* == null)) {
             return error.InconsistentForwardOptions;
-        }
-        if (!options.prefill and try x.dim(1) != 1) {
-            return error.DecodingWithMoreThanOneInputToken;
         }
 
         const input_shape = try x.shape();
@@ -171,10 +168,10 @@ pub const AttentionBlock = struct {
         try q_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
 
         const head_size: c_int = @intCast(try q_heads.dim(3));
-        const offset: c_int = if (options.prefill)
-            0
+        const offset: c_int = if (options.cached_k.*) |*cached_k|
+            @intCast(try cached_k.dim(2))
         else
-            @intCast(try options.cached_k.*.?.dim(2));
+            0;
         try q_heads.ropeMut(head_size, self.rope_theta, offset, strm);
 
         const kv_shape = try k.shape();
@@ -197,7 +194,7 @@ pub const AttentionBlock = struct {
 
         var resolved_k: Tensor = undefined;
         var resolved_v: Tensor = undefined;
-        if (options.prefill) {
+        if (options.prefill and options.cached_k.* == null and options.cached_v.* == null) {
             options.cached_k.* = try k_heads.clone();
             options.cached_v.* = try v_heads.clone();
             resolved_k = k_heads;

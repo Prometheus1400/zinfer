@@ -67,12 +67,53 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
     }
 }
 
+fn handleChat(ctx: Context, a: args.ChatArgs) !void {
+    var info = try models.getModelInfo(ctx, a.model);
+    defer info.deinit(ctx.gpa);
+
+    var stdout_buf: [128]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(ctx.io, &stdout_buf);
+    var stdout = &stdout_writer.interface;
+
+    var stdin_buf: [128]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(ctx.io, &stdin_buf);
+
+    switch (info.config) {
+        .qwen_config => {
+            var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info, .{});
+            defer pipeline.deinit();
+
+            try stdout.print("> ", .{});
+            try stdout.flush();
+            while (try stdin_reader.interface.takeDelimiter('\n')) |input| {
+                var queue_buf: [32][]const u8 = undefined;
+                var queue: Queue([]const u8) = .init(&queue_buf);
+                errdefer queue.close(ctx.io);
+
+                try stdout.print("🤖 ", .{});
+                try stdout.flush();
+
+                {
+                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, stdout, .{} };
+                    const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
+                    defer {
+                        queue.close(ctx.io);
+                        std.Thread.join(handle);
+                    }
+                    try pipeline.callStreaming(input, &queue);
+                }
+                try stdout.print("\n>  ", .{});
+                try stdout.flush();
+            }
+        },
+        .empty => {},
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var stream = try mlx.init(.{});
     defer stream.deinit();
-
     const ctx: Context = .{ .gpa = init.gpa, .io = init.io, .stream = stream };
-
     const parsed_args = try args.parseArgs(init.minimal.args);
     if (parsed_args.command) |c| {
         switch (c) {
@@ -81,6 +122,9 @@ pub fn main(init: std.process.Init) !void {
             },
             .prompt => {
                 try generateResponse(ctx, c.prompt);
+            },
+            .chat => {
+                try handleChat(ctx, c.chat);
             },
         }
     }
