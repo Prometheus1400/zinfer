@@ -7,6 +7,7 @@ const zinfer = @import("zinfer");
 
 const Context = zinfer.Context;
 const Queue = std.Io.Queue;
+const template = zinfer.template;
 
 const log = std.log.scoped(.main);
 
@@ -42,23 +43,32 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
             var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info, .{});
             defer pipeline.deinit();
 
+            const conversation: zinfer.Conversation = .{
+                .id = "1",
+                .messages = &.{
+                    .{
+                        .role = "user",
+                        .content = a.prompt,
+                    },
+                },
+            };
             if (a.stream) {
                 var queue_buf: [32][]const u8 = undefined;
                 var queue: Queue([]const u8) = .init(&queue_buf);
                 errdefer queue.close(ctx.io);
 
                 {
-                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, stdout, .{} };
+                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, &.{stdout}, .{} };
                     const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
                     defer {
                         queue.close(ctx.io);
                         std.Thread.join(handle);
                     }
-                    try pipeline.callStreaming(a.prompt, &queue);
+                    try pipeline.callStreaming(conversation, &queue);
                 }
                 try stdout.print("\n", .{});
             } else {
-                var res = try pipeline.call(a.prompt);
+                var res = try pipeline.call(conversation);
                 defer res.deinit(ctx.gpa);
                 try stdout.print("{s}\n", .{res.items});
             }
@@ -77,6 +87,11 @@ fn handleChat(ctx: Context, a: args.ChatArgs) !void {
 
     var stdin_buf: [128]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(ctx.io, &stdin_buf);
+    var stdin_collector = std.Io.Writer.Allocating.init(ctx.gpa);
+    defer stdin_collector.deinit();
+
+    var model_output_collector = std.Io.Writer.Allocating.init(ctx.gpa);
+    defer model_output_collector.deinit();
 
     switch (info.config) {
         .qwen_config => {
@@ -85,25 +100,46 @@ fn handleChat(ctx: Context, a: args.ChatArgs) !void {
 
             try stdout.print("> ", .{});
             try stdout.flush();
-            while (try stdin_reader.interface.takeDelimiter('\n')) |input| {
+            var messages: std.ArrayList(template.Message) = .empty;
+            defer {
+                for (messages.items) |m| ctx.gpa.free(m.content);
+                messages.deinit(ctx.gpa);
+            }
+            while (try stdin_reader.interface.streamDelimiterEnding(&stdin_collector.writer, '\n') != 0) {
+                defer stdin_reader.interface.toss(1);
+                try messages.append(
+                    ctx.gpa,
+                    .{ .role = "user", .content = try stdin_collector.toOwnedSlice() },
+                );
+
                 var queue_buf: [32][]const u8 = undefined;
                 var queue: Queue([]const u8) = .init(&queue_buf);
                 errdefer queue.close(ctx.io);
 
                 try stdout.print("🤖 ", .{});
                 try stdout.flush();
-
                 {
-                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, stdout, .{} };
+                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{
+                        ctx.gpa,
+                        ctx.io,
+                        &queue,
+                        &.{ stdout, &model_output_collector.writer },
+                        .{},
+                    };
                     const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
                     defer {
                         queue.close(ctx.io);
                         std.Thread.join(handle);
                     }
-                    try pipeline.callStreaming(input, &queue);
+                    try pipeline.callStreaming(.{ .id = "1", .messages = messages.items }, &queue);
                 }
                 try stdout.print("\n>  ", .{});
                 try stdout.flush();
+
+                try messages.append(
+                    ctx.gpa,
+                    .{ .role = "assistant", .content = try model_output_collector.toOwnedSlice() },
+                );
             }
         },
         .empty => {},

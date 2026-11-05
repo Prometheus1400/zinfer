@@ -2,11 +2,13 @@ const mlx = @import("mlx");
 const models = @import("root.zig");
 const std = @import("std");
 const template = @import("chat_template");
+const common = @import("common.zig");
 
 const cache = mlx.nn.cache;
 
 const ChatTemplate = template.ChatTemplate;
 const Context = @import("../context.zig").Context;
+const ConversationState = @import("conversation_state.zig").ConversationState;
 const Queue = std.Io.Queue;
 const Stream = mlx.Stream;
 const Tensor = mlx.Tensor;
@@ -39,6 +41,14 @@ pub const Config = struct {
     use_cache: bool,
     use_sliding_window: bool,
     vocab_size: u32,
+};
+
+const TokenizerConfig = struct {
+    chat_template: []const u8,
+    additional_special_tokens: [][]const u8,
+    model_max_length: u32,
+    eos_token: []const u8,
+    pad_token: []const u8,
 };
 
 pub const Handler = struct {
@@ -124,9 +134,8 @@ pub const Handler = struct {
     }
 
     // TODO: Apply max_new_tokens and kv_caching_strategy from pipeline_args to the returned pipeline.
-    // zig fmt: off
     pub fn buildPipeline(
-        ctx: Context, 
+        ctx: Context,
         info: *const models.ModelInfo,
         pipeline_args: struct {
             /// Zero selects greedy decoding; positive values scale logits before sampling.
@@ -135,11 +144,10 @@ pub const Handler = struct {
             max_new_tokens: u32 = 2048,
             kv_caching_strategy: enum {
                 none,
-                simple
+                simple,
             } = .simple,
-        }
+        },
     ) !Pipeline {
-    // zig fmt: on
         const config = switch (info.config) {
             .qwen_config => |parsed| parsed.value,
             .empty => return error.MissingModelConfig,
@@ -166,11 +174,6 @@ pub const Handler = struct {
         var tokenizer = try Tokenizer.fromFile(ctx, info.tokenizer_file_path);
         errdefer tokenizer.deinit();
 
-        var kv_cache: std.ArrayList(cache.ContiguousKVCache) = try .initCapacity(ctx.gpa, config.num_hidden_layers);
-        for (0..config.num_hidden_layers) |_| {
-            try kv_cache.append(ctx.gpa, .{ .strm = ctx.stream });
-        }
-
         return .{
             .gpa = ctx.gpa,
             .io = ctx.io,
@@ -181,23 +184,13 @@ pub const Handler = struct {
             .embedding_weights = embedding_weights,
             .chat_template = try getChatTemplate(ctx, info.tokenizer_config_file_path),
             .stop_tokens = try ctx.gpa.dupe(u32, info.generation_config.value.eos_token_id),
-            // .pipeline_generation_config = .{ .generation_config = info.generation_config.value },
-            .kv_cache = kv_cache,
+            .conversation_states = .init(ctx.gpa),
             .temperature = pipeline_args.temperature,
             .repetition_penalty = pipeline_args.repetition_penalty,
+            .pad_token = 69, // TODO
         };
     }
 };
-
-// zig fmt: off
-const TokenizerConfig = struct { 
-    chat_template: []const u8,
-    additional_special_tokens: [][]const u8,
-    model_max_length: u32,
-    eos_token: []const u8,
-    pad_token: []const u8 
-};
-// zig fmt: on
 
 pub const Pipeline = struct {
     const Self = @This();
@@ -205,18 +198,19 @@ pub const Pipeline = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     strm: Stream,
+
     tokenizer: Tokenizer,
     transformer_layers: std.ArrayList(mlx.nn.TransformerBlock),
     norm: Tensor,
     embedding_weights: Tensor,
     chat_template: ChatTemplate,
 
-    kv_cache: std.ArrayList(cache.ContiguousKVCache),
     stop_tokens: []const u32,
+    pad_token: u32,
     temperature: f32,
     max_new_tokens: u32 = 512,
     repetition_penalty: f32,
-    needs_prefill: bool = true,
+    conversation_states: std.StringHashMap(ConversationState),
 
     pub fn deinit(self: *Self) void {
         for (self.transformer_layers.items) |*layer| {
@@ -227,34 +221,167 @@ pub const Pipeline = struct {
         self.embedding_weights.deinit();
         self.tokenizer.deinit();
         self.chat_template.deinit();
-        for (self.kv_cache.items) |*c| {
-            c.deinit();
-        }
-        self.kv_cache.deinit(self.gpa);
         self.gpa.free(self.stop_tokens);
+
+        var conversation_states_iterator = self.conversation_states.iterator();
+        while (conversation_states_iterator.next()) |entry| {
+            // self.gpa.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.gpa);
+        }
+        self.conversation_states.deinit();
     }
 
-    /// Applies the chat template and tokenizes
-    fn preprocess(self: Self, input: []const u8) !Tensor {
-        const messages: []const template.Message = &.{
-            .{ .role = "user", .content = input },
-        };
+    fn padBatch(self: Self, batch: []const []const c_int) ![][]const c_int {
+        var max_seq_length: usize = 0;
+        for (batch) |row| {
+            max_seq_length = @max(max_seq_length, row.len);
+        }
 
-        const initial_prompt = try self.chat_template.render(self.gpa, messages, .{});
-        defer self.gpa.free(initial_prompt);
+        var padded_batch = try std.ArrayList([]const c_int).initCapacity(self.gpa, batch.len);
+        errdefer {
+            for (padded_batch.items) |row| {
+                self.gpa.free(row);
+            }
+            padded_batch.deinit(self.gpa);
+        }
 
-        return self.tokenizer.encode(initial_prompt);
+        for (batch) |row| {
+            const offset = max_seq_length - row.len;
+            const new_row_buf = try self.gpa.alloc(c_int, max_seq_length);
+            @memset(new_row_buf[0..offset], @intCast(self.pad_token));
+            @memcpy(new_row_buf[offset..], row);
+            padded_batch.appendAssumeCapacity(new_row_buf);
+        }
+
+        return padded_batch.toOwnedSlice(self.gpa);
     }
 
-    fn forward(self: Self, input: Tensor, options: struct { generated_tokens: *Tensor, prefill: bool }) !?Tensor {
+    /// Copies a rectangular batch of token IDs into a tensor.
+    fn batchToTensor(self: Self, batch: []const []const c_int) !Tensor {
+        if (batch.len == 0) return error.EmptyBatch;
+        const max_seq_len = batch[0].len;
+        const flattened = try self.gpa.alloc(c_int, batch.len * max_seq_len);
+        defer self.gpa.free(flattened);
+        for (batch, 0..) |row, i| {
+            if (row.len != max_seq_len) return error.InconsistentMaxSeqLen;
+            @memcpy(flattened[i * max_seq_len .. i * max_seq_len + max_seq_len], row);
+        }
+        return try mlx.Tensor.fromSlice(c_int, flattened, &[_]c_int{ @intCast(batch.len), @intCast(max_seq_len) });
+    }
+
+    /// Renders the chat template and tokenizes
+    fn preprocess(self: Self, batch: []const common.Conversation) ![][]const c_int {
+        var encodings = std.ArrayList([]const c_int).empty;
+        errdefer {
+            for (encodings.items) |encoding| {
+                self.gpa.free(encoding);
+            }
+            encodings.deinit(self.gpa);
+        }
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        for (batch) |conversation| {
+            const prompt = try self.chat_template.render(arena.allocator(), conversation.messages, .{});
+            try encodings.append(self.gpa, try self.tokenizer.encode(self.gpa, prompt));
+        }
+        return try encodings.toOwnedSlice(self.gpa);
+    }
+
+    /// Returns newly sampled token IDs owned by the caller; free with self.gpa.
+    /// Borrows token rows and generated histories in conversation_ids order.
+    fn forward(
+        self: *Self,
+        batch: []const []const c_int,
+        conversation_ids: []const []const u8,
+        generated_token_ids: []const []const c_int,
+        opts: struct {
+            prefill: bool,
+        },
+    ) ![]const c_int {
+        if (batch.len != conversation_ids.len or batch.len != generated_token_ids.len) {
+            return error.InconsistentForwardOptions;
+        }
+
+        const uncached_token_ids = try self.uncached_tokens_batch(batch, conversation_ids);
+        defer self.gpa.free(uncached_token_ids);
+
+        const real_token_counts = try self.gpa.alloc(usize, batch.len);
+        defer self.gpa.free(real_token_counts);
+        for (uncached_token_ids, 0..) |row, i| {
+            real_token_counts[i] = row.len;
+        }
+
+        const padded_uncached_token_ids = try self.padBatch(uncached_token_ids);
+        defer {
+            for (padded_uncached_token_ids) |row| {
+                self.gpa.free(row);
+            }
+            self.gpa.free(padded_uncached_token_ids);
+        }
+        var input = try self.batchToTensor(padded_uncached_token_ids);
+        defer input.deinit();
+
+        if (opts.prefill) {
+            log.debug("encoded prompt into token IDs (dimensions={any})", .{input.shape()});
+        }
+
+        var sampled = try self.forwardTensor(input, .{
+            .generated_token_ids = generated_token_ids,
+            .prefill = opts.prefill,
+            .conversation_ids = conversation_ids,
+            .real_token_counts = real_token_counts,
+        });
+        defer sampled.deinit();
+
+        const token_ids = try self.gpa.alloc(c_int, try sampled.dim(0));
+        errdefer self.gpa.free(token_ids);
+        for (token_ids, 0..) |*id, r| {
+            const row: c_int = @intCast(r);
+            var sampled_row = try sampled.slice(&.{ row, 0 }, &.{ row + 1, 1 }, &.{ 1, 1 }, self.strm);
+            defer sampled_row.deinit();
+            id.* = @intCast(try sampled_row.itemU32());
+        }
+
+        // Only processed inputs are represented in the KV cache.
+        for (uncached_token_ids, conversation_ids) |row, id| {
+            const state = self.conversation_states.getPtr(id) orelse return error.NoConversationState;
+            try state.cached_token_ids.appendSlice(self.gpa, row);
+        }
+        return token_ids;
+    }
+
+    fn forwardTensor(
+        self: Self,
+        input: Tensor,
+        ctx: struct {
+            generated_token_ids: []const []const c_int,
+            prefill: bool,
+            conversation_ids: []const []const u8,
+            real_token_counts: []const usize,
+        },
+    ) !Tensor {
         // Look up an embedding vector for each input token ID.
         var x = try self.embedding_weights.take(input, 0, self.strm);
         defer x.deinit();
 
         // Pass the hidden vectors through each transformer layer, updating its KV cache.
+        const layer_caches = try self.gpa.alloc(*cache.ContiguousKVCache, ctx.conversation_ids.len);
+        defer self.gpa.free(layer_caches);
         for (self.transformer_layers.items, 0..) |*l, i| {
-            const layer_cache = &self.kv_cache.items[i];
-            const transformer_layer_output = try l.forward(x, self.strm, .{ .prefill = options.prefill, .kv_cache = layer_cache });
+            for (ctx.conversation_ids, 0..) |id, b| {
+                const state = self.conversation_states.getPtr(id) orelse return error.NoConversationState;
+                layer_caches[b] = &state.kv_cache.items[i];
+            }
+            const transformer_layer_output = try l.forward(
+                x,
+                self.strm,
+                .{
+                    .gpa = self.gpa,
+                    .prefill = ctx.prefill,
+                    .kv_caches = layer_caches,
+                    .real_token_counts = ctx.real_token_counts,
+                },
+            );
             x.deinit();
             x = transformer_layer_output;
         }
@@ -264,11 +391,12 @@ pub const Pipeline = struct {
 
         // Shape: [batch, token count, hidden size].
         const ref_shape = try x.shape();
+        const batch_size = ref_shape[0];
         const tokens_size = ref_shape[1];
         const logits_size = ref_shape[2];
 
         // Select the last input position's hidden vector to predict the next token.
-        var last_hidden_state = try x.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ 1, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
+        var last_hidden_state = try x.slice(&[_]c_int{ 0, tokens_size - 1, 0 }, &[_]c_int{ batch_size, tokens_size, logits_size }, &[_]c_int{ 1, 1, 1 }, self.strm);
         defer last_hidden_state.deinit();
 
         var projection = try self.embedding_weights.transpose(self.strm);
@@ -278,95 +406,167 @@ pub const Pipeline = struct {
         var next_token_logits = try last_hidden_state.matMul(projection, self.strm);
         defer next_token_logits.deinit();
 
-        // repetition penalty
-        // zig fmt: off
-        var prev_gen_tokens_probs = try next_token_logits.gather(
-            &[_]Tensor{options.generated_tokens.*},
-            &[_]c_int{2},
-            &[_]c_int{1, 1, 1},
-            self.strm
-        );
-        // zig fmt: on
-        defer prev_gen_tokens_probs.deinit();
-
+        // Apply each row's repetition penalty using its borrowed generation history.
         var penalty = Tensor.scalar(self.repetition_penalty);
         defer penalty.deinit();
-        var positive_penalty_results = try prev_gen_tokens_probs.div(penalty, self.strm);
-        defer positive_penalty_results.deinit();
-        var negative_penalty_results = try prev_gen_tokens_probs.mul(penalty, self.strm);
-        defer negative_penalty_results.deinit();
+        var zeros = Tensor.scalar(0);
+        defer zeros.deinit();
+        const vocab_size: c_int = @intCast(try next_token_logits.dim(2));
+        for (ctx.generated_token_ids, 0..) |history, r| {
+            if (history.len == 0) continue;
 
-        const zeros = Tensor.scalar(0);
-        var mask = try prev_gen_tokens_probs.greaterEqual(zeros, self.strm);
-        defer mask.deinit();
+            const row: c_int = @intCast(r);
+            const start: []const c_int = &.{ row, 0, 0 };
+            const stop: []const c_int = &.{ row + 1, 1, vocab_size };
+            const strides: []const c_int = &.{ 1, 1, 1 };
+            var row_logits = try next_token_logits.slice(start, stop, strides, self.strm);
+            defer row_logits.deinit();
+            var history_tensor = try Tensor.fromSlice(c_int, history, &.{ 1, @intCast(history.len) });
+            defer history_tensor.deinit();
 
-        var updated_prev_gen_tokens_probs = try Tensor.where(mask, positive_penalty_results, negative_penalty_results, self.strm);
-        defer updated_prev_gen_tokens_probs.deinit();
+            var prev_gen_tokens_probs = try row_logits.gather(
+                &.{history_tensor},
+                &.{2},
+                &.{ 1, 1, 1 },
+                self.strm,
+            );
+            defer prev_gen_tokens_probs.deinit();
+            var positive_penalty_results = try prev_gen_tokens_probs.div(penalty, self.strm);
+            defer positive_penalty_results.deinit();
+            var negative_penalty_results = try prev_gen_tokens_probs.mul(penalty, self.strm);
+            defer negative_penalty_results.deinit();
+            var mask = try prev_gen_tokens_probs.greaterEqual(zeros, self.strm);
+            defer mask.deinit();
+            var updated_prev_gen_tokens_probs = try Tensor.where(mask, positive_penalty_results, negative_penalty_results, self.strm);
+            defer updated_prev_gen_tokens_probs.deinit();
+            var penalized_row = try row_logits.scatter(&.{history_tensor}, updated_prev_gen_tokens_probs, &.{2}, self.strm);
+            defer penalized_row.deinit();
 
-        var penalty_applied_next_token_logits = try next_token_logits.scatter(&[_]Tensor{options.generated_tokens.*}, updated_prev_gen_tokens_probs, &[_]c_int{2}, self.strm);
-        defer penalty_applied_next_token_logits.deinit();
+            try next_token_logits.sliceUpdateMut(penalized_row, start, stop, strides, self.strm);
+        }
 
-        var id_tensor = blk: {
+        const id_tensor = blk: {
             if (self.temperature == 0) {
                 // Greedy decoding selects the highest-scoring token deterministically.
-                break :blk try penalty_applied_next_token_logits.argmax(-1, self.strm);
+                break :blk try next_token_logits.argmax(-1, self.strm);
             } else {
                 var temp = Tensor.scalar(self.temperature);
                 defer temp.deinit();
-                try penalty_applied_next_token_logits.divMut(temp, self.strm);
+                try next_token_logits.divMut(temp, self.strm);
                 // TODO: top-k and top-p sampling
-                break :blk try penalty_applied_next_token_logits.categorical(-1, self.strm);
+                break :blk try next_token_logits.categorical(-1, self.strm);
             }
         };
-
-        try options.generated_tokens.concatMut(id_tensor, 1, self.strm);
-
-        if (std.mem.findScalar(u32, self.stop_tokens, try id_tensor.itemU32()) != null) {
-            defer id_tensor.deinit();
-            return null;
-        }
 
         return id_tensor;
     }
 
-    fn emitToken(self: Self, token_tensor: Tensor, output: *Queue([]const u8)) !void {
-        const id = try token_tensor.itemU32();
-        const token = try self.tokenizer.decode(self.gpa, &[1]u32{id});
+    fn emitToken(self: Self, id: c_int, output: *Queue([]const u8)) !void {
+        const token = try self.tokenizer.decode(self.gpa, &[1]u32{@intCast(id)});
         errdefer self.gpa.free(token);
         _ = try output.put(self.io, &[1][]const u8{token}, 1);
     }
 
-    pub fn callStreaming(self: Self, input: []const u8, output: *Queue([]const u8)) !void {
-        log.debug("generating response for: \"{s}...\"", .{input[0..@min(25, input.len)]});
+    /// returns a view into the uncached tokens we will need to process - do not call free on it
+    fn uncached_tokens(self: Self, token_ids: []const c_int, conversation_id: []const u8) ![]const c_int {
+        const conversation = self.conversation_states.getPtr(conversation_id) orelse return error.NoConversationState;
+
+        if (std.mem.cutPrefix(c_int, token_ids, conversation.cached_token_ids.items)) |new_tokens| {
+            return new_tokens;
+        }
+
+        conversation.reset();
+        return token_ids;
+    }
+
+    fn uncached_tokens_batch(self: Pipeline, token_ids_batch: []const []const c_int, conversation_ids: []const []const u8) ![][]const c_int {
+        var uncached_tokens_batch_list = std.ArrayList([]const c_int).empty;
+        errdefer uncached_tokens_batch_list.deinit(self.gpa);
+
+        for (token_ids_batch, conversation_ids) |token_ids, conversation_id| {
+            try uncached_tokens_batch_list.append(self.gpa, try self.uncached_tokens(token_ids, conversation_id));
+        }
+
+        return try uncached_tokens_batch_list.toOwnedSlice(self.gpa);
+    }
+
+    pub fn callStreaming(self: *Self, conversation: common.Conversation, output: *Queue([]const u8)) !void {
+        const conversations: []const common.Conversation = &.{conversation};
+        log.debug("generating response for batch of size: {d}", .{conversations.len});
+
+        // if any error happens we can reset the conversation states for conversations involved
+        errdefer {
+            for (conversations) |row| {
+                const state = self.conversation_states.getPtr(row.id) orelse continue;
+                state.reset();
+            }
+        }
+
+        if (!self.conversation_states.contains(conversation.id)) {
+            try self.conversation_states.put(conversation.id, try .init(self.gpa, self.transformer_layers.items.len, self.strm));
+        }
+
+        // close output channel regardless of what happens
         defer output.close(self.io);
 
-        var encoded_input = try self.preprocess(input);
-        defer encoded_input.deinit();
+        const token_ids_batch = try self.preprocess(conversations);
+        defer {
+            for (token_ids_batch) |row| {
+                self.gpa.free(row);
+            }
+            self.gpa.free(token_ids_batch);
+        }
 
-        log.debug("encoded prompt into token IDs (dimensions={any})", .{encoded_input.shape()});
+        var tokens: std.ArrayList(c_int) = .empty;
+        defer tokens.deinit(self.gpa);
+        try tokens.appendSlice(self.gpa, token_ids_batch[0]);
+        const generation_start = tokens.items.len;
 
-        var generated_tokens = try Tensor.zeros(&[_]c_int{ 1, 0 }, .int32, self.strm);
-        defer generated_tokens.deinit();
+        var batch = [_][]const c_int{tokens.items};
+        var generated_token_ids = [_][]const c_int{tokens.items[generation_start..]};
+        const conversation_ids: []const []const u8 = &.{conversation.id};
 
-        var token_tensor = try self.forward(encoded_input, .{ .generated_tokens = &generated_tokens, .prefill = true }) orelse return;
-        defer token_tensor.deinit();
-        try self.emitToken(token_tensor, output);
+        var token_ids = try self.forward(&batch, conversation_ids, &generated_token_ids, .{ .prefill = true });
+        defer self.gpa.free(token_ids);
 
+        try tokens.append(self.gpa, token_ids[0]);
+        batch[0] = tokens.items;
+        generated_token_ids[0] = tokens.items[generation_start..];
+
+        if (std.mem.findScalar(u32, self.stop_tokens, @intCast(token_ids[0])) != null) {
+            // forward pass to fill the kv cache
+            const discarded = try self.forward(&batch, conversation_ids, &generated_token_ids, .{ .prefill = false });
+            defer self.gpa.free(discarded);
+            return;
+        }
+        try self.emitToken(token_ids[0], output);
+
+        // start at 1 to account for token generated during the prefill
         for (1..self.max_new_tokens) |_| {
-            const output_token_tensor = try self.forward(token_tensor, .{ .generated_tokens = &generated_tokens, .prefill = false }) orelse return;
-            try self.emitToken(output_token_tensor, output);
+            const new_token_ids = try self.forward(&batch, conversation_ids, &generated_token_ids, .{ .prefill = false });
+            errdefer self.gpa.free(new_token_ids);
 
-            token_tensor.deinit();
-            token_tensor = output_token_tensor;
+            try tokens.append(self.gpa, new_token_ids[0]);
+            batch[0] = tokens.items;
+            generated_token_ids[0] = tokens.items[generation_start..];
+
+            if (std.mem.findScalar(u32, self.stop_tokens, @intCast(new_token_ids[0])) != null) {
+                // forward pass to fill the kv cache
+                const discarded = try self.forward(&batch, conversation_ids, &generated_token_ids, .{ .prefill = false });
+                defer self.gpa.free(discarded);
+                self.gpa.free(new_token_ids);
+                return;
+            }
+            try self.emitToken(new_token_ids[0], output);
+
+            self.gpa.free(token_ids);
+            token_ids = new_token_ids;
         }
 
         log.debug("max_new_tokens = {d} limit reached", .{self.max_new_tokens});
     }
 
-    pub fn call(self: Self, input: []const u8) !std.ArrayList(u8) {
-        var encoded_input = try self.preprocess(input);
-        defer encoded_input.deinit();
-
+    pub fn call(self: *Self, conversation: common.Conversation) !std.ArrayList(u8) {
         var buf: [32][]const u8 = undefined;
         var queue: Queue([]const u8) = .init(&buf);
         errdefer queue.close(self.io);
@@ -375,13 +575,13 @@ pub const Pipeline = struct {
         defer writer.deinit();
 
         {
-            const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ self.gpa, self.io, &queue, &writer.writer, .{} };
+            const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ self.gpa, self.io, &queue, &.{&writer.writer}, .{} };
             const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
             defer {
                 queue.close(self.io);
                 handle.join();
             }
-            try self.callStreaming(input, &queue);
+            try self.callStreaming(conversation, &queue);
         }
 
         return writer.toArrayList();

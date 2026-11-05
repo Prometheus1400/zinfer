@@ -43,6 +43,7 @@ pub const Tensor = struct {
     pub fn fromSlice(comptime T: type, data: []const T, shape_: []const c_int) !Self {
         const arr = switch (T) {
             f32 => c.mlx_array_new_data(data.ptr, shape_.ptr, @intCast(shape_.len), c.MLX_FLOAT32),
+            f16 => c.mlx_array_new_data(data.ptr, shape_.ptr, @intCast(shape_.len), c.MLX_BFLOAT16),
             c_int => c.mlx_array_new_data(data.ptr, shape_.ptr, @intCast(shape_.len), c.MLX_INT32),
             else => return error.UnsupportedType,
         };

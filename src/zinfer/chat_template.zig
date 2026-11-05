@@ -32,7 +32,7 @@ pub const ChatTemplate = struct {
 
     /// Returns an owned prompt string; the caller frees it with gpa.free.
     /// Supports text messages. Tool schemas and multimodal content are not supplied.
-    pub fn render(self: Self, gpa: std.mem.Allocator, messages: []const Message, options: RenderOptions) ![]u8 {
+    pub fn render(self: Self, gpa: std.mem.Allocator, messages: []const Message, options: RenderOptions) ![]const u8 {
         const p = self.p orelse return error.ClosedTemplate;
         var context = c.mj_value_new_object();
         defer c.mj_value_decref(&context);

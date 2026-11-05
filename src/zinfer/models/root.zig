@@ -5,6 +5,7 @@ const Context = @import("../context.zig").Context;
 const Queue = std.Io.Queue;
 
 pub const qwen = @import("qwen.zig");
+pub const common = @import("common.zig");
 
 pub const ModelConfig = union(enum) {
     const Self = @This();
@@ -120,7 +121,8 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
     return error.UnknownModel;
 }
 
-pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writer: *std.Io.Writer, options: struct { flush: bool = true }) !void {
+// todo -> make take in multiple writers
+pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writers: []const *std.Io.Writer, options: struct { flush: bool = true }) !void {
     while (true) {
         const token = queue.getOne(io) catch |e| {
             switch (e) {
@@ -130,9 +132,11 @@ pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queu
         };
         defer gpa.free(token);
 
-        try writer.writeAll(token);
-        if (options.flush) {
-            try writer.flush();
+        for (writers) |writer| {
+            try writer.writeAll(token);
+            if (options.flush) {
+                try writer.flush();
+            }
         }
     }
 }

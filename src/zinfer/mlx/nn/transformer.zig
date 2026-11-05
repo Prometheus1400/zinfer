@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const loadWeight = @import("weights.zig").load;
 
 const Map = @import("../map.zig").Map;
@@ -13,8 +15,12 @@ pub const Config = struct {
 };
 
 pub const AttentionContext = struct {
+    gpa: std.mem.Allocator,
     prefill: bool,
-    kv_cache: *ContiguousKVCache,
+    /// borrowed caches in batch order, for this transformer layer only.
+    kv_caches: []const *ContiguousKVCache,
+    /// mapping to look up the actual non-padded tokens for a row in the batch
+    real_token_counts: []const usize,
 };
 
 pub const TransformerBlock = struct {
@@ -50,11 +56,15 @@ pub const TransformerBlock = struct {
         self.post_attention_layernorm_w.deinit();
     }
 
-    pub fn forward(self: *Self, x: Tensor, strm: Stream, options: AttentionContext) !Tensor {
+    pub fn forward(self: *Self, x: Tensor, strm: Stream, opts: AttentionContext) !Tensor {
+        if (try x.dim(0) != opts.kv_caches.len) {
+            return error.InconsistentForwardOptions;
+        }
+
         var rms_1 = try Tensor.rms(x, self.input_layernorm_w, strm);
         defer rms_1.deinit();
 
-        var attention_output = try self.attention.forward(rms_1, strm, options);
+        var attention_output = try self.attention.forward(rms_1, strm, opts);
         defer attention_output.deinit();
 
         var h = try Tensor.add(attention_output, x, strm);
@@ -131,12 +141,7 @@ pub const AttentionBlock = struct {
         self.o_proj_w.deinit();
     }
 
-    pub fn forward(self: *Self, x: Tensor, strm: Stream, options: AttentionContext) !Tensor {
-        // if ((options.cached_k.* == null and options.cached_v.* != null) or (options.cached_k.* != null and options.cached_v.* == null)) {
-        //     return error.InconsistentForwardOptions;
-        // }
-        const cache = options.kv_cache;
-
+    pub fn forward(self: *Self, x: Tensor, strm: Stream, opts: AttentionContext) !Tensor {
         const input_shape = try x.shape();
 
         // TODO: do this once on init and resuse the transposed handles (unsure if this will improve perf)
@@ -157,53 +162,190 @@ pub const AttentionBlock = struct {
         defer v.deinit();
         try v.addMut(self.v_bias, strm);
 
-        // zig fmt: off
         var q_heads = try Tensor.reshape(q, &[_]c_int{
-            input_shape[0],                     // batch
-            input_shape[1],                     // tokens
+            input_shape[0], // batch
+            input_shape[1], // tokens
             @intCast(self.num_attention_heads), // heads
-            -1,                                 // infer head dimension: 64
+            -1, // infer head dimension: 64
         }, strm);
-        // zig fmt: on
         defer q_heads.deinit();
         try q_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
 
         const head_size: c_int = @intCast(try q_heads.dim(3));
-        const offset: c_int = @intCast(cache.len);
+        // const offset: c_int = @intCast(cache.len);
 
-        try q_heads.ropeMut(head_size, self.rope_theta, offset, strm);
+        for (0..try q_heads.dim(0)) |r| {
+            const batch_index: c_int = @intCast(r);
+            const row_width = input_shape[1];
+            const first_token = row_width - @as(c_int, @intCast(opts.real_token_counts[r]));
+
+            const start: []const c_int = &.{
+                batch_index,
+                0,
+                first_token,
+                0,
+            };
+            const stop: []const c_int = &.{
+                batch_index + 1,
+                @intCast(self.num_attention_heads),
+                row_width,
+                head_size,
+            };
+            const strides: []const c_int = &.{ 1, 1, 1, 1 };
+
+            var q_row = try q_heads.slice(
+                start,
+                stop,
+                strides,
+                strm,
+            );
+            defer q_row.deinit();
+            const offset: c_int = @intCast(opts.kv_caches[r].len);
+
+            try q_row.ropeMut(head_size, self.rope_theta, offset, strm);
+
+            try q_heads.sliceUpdateMut(
+                q_row,
+                start,
+                stop,
+                strides,
+                strm,
+            );
+        }
 
         const kv_shape = try k.shape();
-        // zig fmt: off
         const new_kv_shape = [_]c_int{
-            kv_shape[0],                        // batch
-            kv_shape[1],                        // tokens
+            kv_shape[0], // batch
+            kv_shape[1], // tokens
             @intCast(self.num_key_value_heads), // heads
-            -1,                                 // infer head dimension: 64
+            -1, // infer head dimension: 64
         };
-        // zig fmt: on
-        var k_heads = try Tensor.reshape(k, &new_kv_shape, strm);
-        defer k_heads.deinit();
-        try k_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
-        try k_heads.ropeMut(head_size, self.rope_theta, offset, strm);
 
         var v_heads = try Tensor.reshape(v, &new_kv_shape, strm);
         defer v_heads.deinit();
         try v_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
 
-        var resolved_k: Tensor = undefined;
-        var resolved_v: Tensor = undefined;
-        if (options.prefill and cache.len == 0) {
-            resolved_k = k_heads;
-            resolved_v = v_heads;
-        } else {
-            const kv = try cache.get();
-            resolved_k = try kv.k.concat(k_heads, 2, strm);
-            resolved_v = try kv.v.concat(v_heads, 2, strm);
-        }
-        try cache.append(.{ .k = k_heads, .v = v_heads });
+        var k_heads = try Tensor.reshape(k, &new_kv_shape, strm);
+        defer k_heads.deinit();
+        try k_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
+        for (0..try k_heads.dim(0)) |r| {
+            const batch_index: c_int = @intCast(r);
+            const row_width = input_shape[1];
+            const first_token = row_width - @as(c_int, @intCast(opts.real_token_counts[r]));
 
-        var attention_output = try Tensor.scaledDotProductAttention(q_heads, resolved_k, resolved_v, 1 / @sqrt(@as(f32, @floatFromInt(head_size))), .causal, strm);
+            const start: []const c_int = &.{
+                batch_index,
+                0,
+                first_token,
+                0,
+            };
+            const stop: []const c_int = &.{
+                batch_index + 1,
+                @intCast(self.num_key_value_heads),
+                row_width,
+                head_size,
+            };
+            const strides: []const c_int = &.{ 1, 1, 1, 1 };
+
+            var k_row = try k_heads.slice(start, stop, strides, strm);
+            defer k_row.deinit();
+            const offset: c_int = @intCast(opts.kv_caches[r].len);
+
+            try k_row.ropeMut(head_size, self.rope_theta, offset, strm);
+            var v_row = try v_heads.slice(start, stop, strides, strm);
+            defer v_row.deinit();
+
+            try opts.kv_caches[r].append(.{ .k = k_row, .v = v_row });
+        }
+
+        var max_cache_len: usize = 0;
+        for (opts.kv_caches) |row_cache| {
+            max_cache_len = @max(max_cache_len, row_cache.len);
+        }
+
+        const cache_shape = [_]c_int{
+            input_shape[0],
+            @intCast(self.num_key_value_heads),
+            @intCast(max_cache_len),
+            head_size,
+        };
+
+        var resolved_k = try Tensor.zeros(&cache_shape, try k_heads.dtype(), strm);
+        defer resolved_k.deinit();
+
+        var resolved_v = try Tensor.zeros(&cache_shape, try v_heads.dtype(), strm);
+        defer resolved_v.deinit();
+
+        for (opts.kv_caches, 0..) |row_cache, r| {
+            const kv = try row_cache.get();
+            var cached_k = kv.k;
+            defer cached_k.deinit();
+            var cached_v = kv.v;
+            defer cached_v.deinit();
+
+            const batch_index: c_int = @intCast(r);
+            const padding: c_int = @intCast(max_cache_len - row_cache.len);
+
+            const start: []const c_int = &.{ batch_index, 0, padding, 0 };
+            const stop: []const c_int = &.{
+                batch_index + 1,
+                @intCast(self.num_key_value_heads),
+                @intCast(max_cache_len),
+                head_size,
+            };
+            const strides: []const c_int = &.{ 1, 1, 1, 1 };
+
+            try resolved_k.sliceUpdateMut(cached_k, start, stop, strides, strm);
+            try resolved_v.sliceUpdateMut(cached_v, start, stop, strides, strm);
+        }
+
+        // TODO: understand this better start ---------------------------------------
+        const batch_size = opts.kv_caches.len;
+        const query_width: usize = @intCast(input_shape[1]);
+        const values = try opts.gpa.alloc(
+            f16,
+            batch_size * query_width * max_cache_len,
+        );
+        defer opts.gpa.free(values);
+
+        @memset(values, -std.math.inf(f16));
+        for (opts.kv_caches, 0..) |row_cache, b| {
+            const incoming = opts.real_token_counts[b];
+            const query_padding = query_width - incoming;
+            const key_padding = max_cache_len - row_cache.len;
+            const old_tokens = row_cache.len - incoming;
+
+            for (0..query_width) |i| {
+                // Find the beginning of this query's mask row.
+                const row_start = (b * query_width + i) * max_cache_len;
+
+                const allowed_count = if (i < query_padding)
+                    1 // Dummy attention for a padded query.
+                else
+                    old_tokens + (i - query_padding) + 1;
+
+                const start = row_start + key_padding;
+                @memset(values[start .. start + allowed_count], 0);
+            }
+        }
+
+        var attention_mask = try Tensor.fromSlice(f16, values, &.{
+            @intCast(batch_size),
+            1,
+            @intCast(query_width),
+            @intCast(max_cache_len),
+        });
+        defer attention_mask.deinit();
+        // TODO: understand this better stop ---------------------------------------
+
+        var attention_output = try Tensor.scaledDotProductAttention(
+            q_heads,
+            resolved_k,
+            resolved_v,
+            1 / @sqrt(@as(f32, @floatFromInt(head_size))),
+            .{ .tensor = attention_mask },
+            strm,
+        );
         errdefer attention_output.deinit();
         try attention_output.permuteMut(&.{ 0, 2, 1, 3 }, strm);
         try attention_output.reshapeMut(&.{ input_shape[0], input_shape[1], -1 }, strm);

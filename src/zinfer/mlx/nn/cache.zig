@@ -17,8 +17,16 @@ pub const ContiguousKVCache = struct {
     v_cache: ?Tensor = null,
 
     pub fn deinit(self: *Self) void {
+        self.clear();
+    }
+
+    pub fn clear(self: *Self) void {
         if (self.k_cache) |*k_cache| k_cache.deinit();
         if (self.v_cache) |*v_cache| v_cache.deinit();
+        self.k_cache = null;
+        self.v_cache = null;
+        self.len = 0;
+        self.cap = 0;
     }
 
     fn remaining_capacity(self: Self) usize {

@@ -17,12 +17,11 @@ pub const Tokenizer = struct {
         return .{ .p = p };
     }
 
-    pub fn encode(self: Self, input: []const u8) !mlx.Tensor {
+    pub fn encode(self: Self, gpa: std.mem.Allocator, input: []const u8) ![]const c_int {
         var res: tok.TokenizerEncodeResult = undefined;
         tok.tokenizers_encode(self.p, input.ptr, input.len, 0, &res);
         defer tok.tokenizers_free_encode_results(&res, 1);
-
-        return try mlx.Tensor.fromSlice(c_int, res.token_ids[0..res.len], &[_]c_int{ 1, @intCast(res.len) });
+        return try gpa.dupe(c_int, res.token_ids[0..res.len]);
     }
 
     /// Returns text borrowed until the next decode call or tokenizer deinit.
