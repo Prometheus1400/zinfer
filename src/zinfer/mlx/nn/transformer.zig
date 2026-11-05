@@ -91,11 +91,14 @@ pub const AttentionBlock = struct {
     v_w: Tensor,
     v_bias: Tensor,
     o_proj_w: Tensor,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
+    num_attention_heads: c_int,
+    num_key_value_heads: c_int,
     rope_theta: f32,
 
     pub fn init(weights: Map(.tensor), layer: usize, config: Config) !Self {
+        const num_attention_heads = std.math.cast(c_int, config.num_attention_heads) orelse return error.InvalidAttentionHeadCount;
+        const num_key_value_heads = std.math.cast(c_int, config.num_key_value_heads) orelse return error.InvalidAttentionHeadCount;
+
         var q_w = try loadWeight(weights, layer, "self_attn.q_proj.weight");
         errdefer q_w.deinit();
 
@@ -125,8 +128,8 @@ pub const AttentionBlock = struct {
             .v_w = v_w,
             .v_bias = v_bias,
             .o_proj_w = o_proj_w,
-            .num_attention_heads = config.num_attention_heads,
-            .num_key_value_heads = config.num_key_value_heads,
+            .num_attention_heads = num_attention_heads,
+            .num_key_value_heads = num_key_value_heads,
             .rope_theta = config.rope_theta,
         };
     }
@@ -165,14 +168,13 @@ pub const AttentionBlock = struct {
         var q_heads = try Tensor.reshape(q, &[_]c_int{
             input_shape[0], // batch
             input_shape[1], // tokens
-            @intCast(self.num_attention_heads), // heads
+            self.num_attention_heads, // heads
             -1, // infer head dimension: 64
         }, strm);
         defer q_heads.deinit();
         try q_heads.permuteMut(&.{ 0, 2, 1, 3 }, strm);
 
-        const head_size: c_int = @intCast(try q_heads.dim(3));
-        // const offset: c_int = @intCast(cache.len);
+        const head_size = (try q_heads.shape())[3];
 
         for (0..try q_heads.dim(0)) |r| {
             const batch_index: c_int = @intCast(r);
@@ -187,7 +189,7 @@ pub const AttentionBlock = struct {
             };
             const stop: []const c_int = &.{
                 batch_index + 1,
-                @intCast(self.num_attention_heads),
+                self.num_attention_heads,
                 row_width,
                 head_size,
             };
@@ -217,7 +219,7 @@ pub const AttentionBlock = struct {
         const new_kv_shape = [_]c_int{
             kv_shape[0], // batch
             kv_shape[1], // tokens
-            @intCast(self.num_key_value_heads), // heads
+            self.num_key_value_heads, // heads
             -1, // infer head dimension: 64
         };
 
@@ -241,7 +243,7 @@ pub const AttentionBlock = struct {
             };
             const stop: []const c_int = &.{
                 batch_index + 1,
-                @intCast(self.num_key_value_heads),
+                self.num_key_value_heads,
                 row_width,
                 head_size,
             };
@@ -265,7 +267,7 @@ pub const AttentionBlock = struct {
 
         const cache_shape = [_]c_int{
             input_shape[0],
-            @intCast(self.num_key_value_heads),
+            self.num_key_value_heads,
             @intCast(max_cache_len),
             head_size,
         };
@@ -289,8 +291,8 @@ pub const AttentionBlock = struct {
             const start: []const c_int = &.{ batch_index, 0, padding, 0 };
             const stop: []const c_int = &.{
                 batch_index + 1,
-                @intCast(self.num_key_value_heads),
-                @intCast(max_cache_len),
+                self.num_key_value_heads,
+                cache_shape[2],
                 head_size,
             };
             const strides: []const c_int = &.{ 1, 1, 1, 1 };
@@ -330,10 +332,10 @@ pub const AttentionBlock = struct {
         }
 
         var attention_mask = try Tensor.fromSlice(f16, values, &.{
-            @intCast(batch_size),
+            input_shape[0],
             1,
-            @intCast(query_width),
-            @intCast(max_cache_len),
+            input_shape[1],
+            cache_shape[2],
         });
         defer attention_mask.deinit();
         // TODO: understand this better stop ---------------------------------------

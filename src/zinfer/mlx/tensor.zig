@@ -69,7 +69,7 @@ pub const Tensor = struct {
 
     pub fn ndim(self: Self) !usize {
         try common.ensure(.{self});
-        return @intCast(c.mlx_array_ndim(self.p));
+        return c.mlx_array_ndim(self.p);
     }
 
     pub fn dim(self: Self, d: usize) !usize {

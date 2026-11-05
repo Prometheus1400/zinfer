@@ -174,6 +174,12 @@ pub const Handler = struct {
         var tokenizer = try Tokenizer.fromFile(ctx, info.tokenizer_file_path);
         errdefer tokenizer.deinit();
 
+        const stop_tokens = try ctx.gpa.alloc(c_int, info.generation_config.value.eos_token_id.len);
+        errdefer ctx.gpa.free(stop_tokens);
+        for (info.generation_config.value.eos_token_id, stop_tokens) |id, *stop_token| {
+            stop_token.* = std.math.cast(c_int, id) orelse return error.InvalidTokenId;
+        }
+
         return .{
             .gpa = ctx.gpa,
             .io = ctx.io,
@@ -183,7 +189,7 @@ pub const Handler = struct {
             .norm = norm,
             .embedding_weights = embedding_weights,
             .chat_template = try getChatTemplate(ctx, info.tokenizer_config_file_path),
-            .stop_tokens = try ctx.gpa.dupe(u32, info.generation_config.value.eos_token_id),
+            .stop_tokens = stop_tokens,
             .conversation_states = .init(ctx.gpa),
             .temperature = pipeline_args.temperature,
             .repetition_penalty = pipeline_args.repetition_penalty,
@@ -205,8 +211,8 @@ pub const Pipeline = struct {
     embedding_weights: Tensor,
     chat_template: ChatTemplate,
 
-    stop_tokens: []const u32,
-    pad_token: u32,
+    stop_tokens: []const c_int,
+    pad_token: c_int,
     temperature: f32,
     max_new_tokens: u32 = 512,
     repetition_penalty: f32,
@@ -248,7 +254,7 @@ pub const Pipeline = struct {
         for (batch) |row| {
             const offset = max_seq_length - row.len;
             const new_row_buf = try self.gpa.alloc(c_int, max_seq_length);
-            @memset(new_row_buf[0..offset], @intCast(self.pad_token));
+            @memset(new_row_buf[0..offset], self.pad_token);
             @memcpy(new_row_buf[offset..], row);
             padded_batch.appendAssumeCapacity(new_row_buf);
         }
@@ -411,7 +417,7 @@ pub const Pipeline = struct {
         defer penalty.deinit();
         var zeros = Tensor.scalar(0);
         defer zeros.deinit();
-        const vocab_size: c_int = @intCast(try next_token_logits.dim(2));
+        const vocab_size = (try next_token_logits.shape())[2];
         for (ctx.generated_token_ids, 0..) |history, r| {
             if (history.len == 0) continue;
 
@@ -533,7 +539,7 @@ pub const Pipeline = struct {
         batch[0] = tokens.items;
         generated_token_ids[0] = tokens.items[generation_start..];
 
-        if (std.mem.findScalar(u32, self.stop_tokens, @intCast(token_ids[0])) != null) {
+        if (std.mem.findScalar(c_int, self.stop_tokens, token_ids[0]) != null) {
             // forward pass to fill the kv cache
             const discarded = try self.forward(&batch, conversation_ids, &generated_token_ids, .{ .prefill = false });
             defer self.gpa.free(discarded);
@@ -550,7 +556,7 @@ pub const Pipeline = struct {
             batch[0] = tokens.items;
             generated_token_ids[0] = tokens.items[generation_start..];
 
-            if (std.mem.findScalar(u32, self.stop_tokens, @intCast(new_token_ids[0])) != null) {
+            if (std.mem.findScalar(c_int, self.stop_tokens, new_token_ids[0]) != null) {
                 // forward pass to fill the kv cache
                 const discarded = try self.forward(&batch, conversation_ids, &generated_token_ids, .{ .prefill = false });
                 defer self.gpa.free(discarded);
