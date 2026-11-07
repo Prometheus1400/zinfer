@@ -116,14 +116,6 @@ pub fn build(b: *std.Build) void {
     minijinja_bindings.addObjectFile(minijinja_library);
     bindings_step.dependOn(&translate_minijinja.step);
 
-    const chat_template = b.createModule(.{
-        .root_source_file = b.path("src/zinfer/chat_template.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    chat_template.addImport("minijinja_c", minijinja_bindings);
-
     const mlx = b.createModule(.{
         .root_source_file = b.path("src/zinfer/mlx/root.zig"),
         .target = target,
@@ -144,8 +136,17 @@ pub fn build(b: *std.Build) void {
     });
     zinfer.addImport("mlx", mlx);
     zinfer.addImport("tokenizers_c", tokenizer_bindings);
-    zinfer.addImport("chat_template", chat_template);
+    zinfer.addImport("minijinja_c", minijinja_bindings);
     zinfer.addImport("build_options", options_module);
+
+    const qwen_tests = b.addTest(.{
+        .root_module = zinfer,
+        .filters = &.{"Qwen batch matches individual greedy responses"},
+    });
+    qwen_tests.step.dependOn(&native.step);
+    const run_qwen_tests = b.addRunArtifact(qwen_tests);
+    run_qwen_tests.stdio = .inherit;
+    b.step("test-qwen", "Compare batched and individual greedy Qwen responses (requires models/qwen)").dependOn(&run_qwen_tests.step);
 
     const app = b.createModule(.{
         .root_source_file = b.path("src/cli/main.zig"),

@@ -17,7 +17,7 @@ pub const Tokenizer = struct {
         return .{ .p = p };
     }
 
-    pub fn encode(self: Self, gpa: std.mem.Allocator, input: []const u8) ![]const c_int {
+    pub fn encode(self: Self, gpa: std.mem.Allocator, input: []const u8) ![]c_int {
         var res: tok.TokenizerEncodeResult = undefined;
         tok.tokenizers_encode(self.p, input.ptr, input.len, 0, &res);
         defer tok.tokenizers_free_encode_results(&res, 1);

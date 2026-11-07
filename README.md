@@ -39,6 +39,7 @@ zig build native      # build all native dependencies
 zig build tokenizers  # build only the tokenizer C library
 zig build minijinja   # build only the MiniJinja C library
 zig build bindings    # translate only the C headers
+zig build test-qwen   # compare batched and individual greedy responses using models/qwen
 ```
 
 The `prompt` command generates a single response; `--stream` prints it as it is

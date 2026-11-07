@@ -1,13 +1,13 @@
+const std = @import("std");
 const args = @import("args.zig");
 const build_options = @import("build_options");
+const zinfer = @import("zinfer");
 const mlx = zinfer.mlx;
 const models = zinfer.models;
-const std = @import("std");
-const zinfer = @import("zinfer");
+
 
 const Context = zinfer.Context;
 const Queue = std.Io.Queue;
-const template = zinfer.template;
 
 const log = std.log.scoped(.main);
 
@@ -25,7 +25,7 @@ fn inspectModel(ctx: Context, a: args.InspectArgs) !void {
     var stdout = std.Io.File.stdout().writerStreaming(ctx.io, &stdout_buf);
 
     switch (info.config) {
-        .qwen_config => try models.qwen.Handler.inspect(ctx, &info, &stdout.interface),
+        .qwen_config => try models.qwen.inspect(ctx, &info, &stdout.interface),
         .empty => {},
     }
 }
@@ -40,10 +40,10 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
 
     switch (info.config) {
         .qwen_config => {
-            var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info, .{});
-            defer pipeline.deinit();
+            var pipeline = try models.qwen.Pipeline.init(ctx, &info, .{});
+            defer pipeline.deinit(ctx.gpa);
 
-            const conversation: zinfer.Conversation = .{
+            const conversation: zinfer.models.common.Conversation = .{
                 .id = "1",
                 .messages = &.{
                     .{
@@ -58,19 +58,19 @@ fn generateResponse(ctx: Context, a: args.PromptArgs) !void {
                 errdefer queue.close(ctx.io);
 
                 {
-                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, &.{stdout}, .{} };
-                    const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
+                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.utils.collectStreamingResponse)) = .{ ctx.gpa, ctx.io, &queue, &.{stdout}, .{} };
+                    const handle = try std.Thread.spawn(.{}, models.utils.collectStreamingResponse, collect_streaming_response_args);
                     defer {
                         queue.close(ctx.io);
                         std.Thread.join(handle);
                     }
-                    try pipeline.callStreaming(conversation, &queue);
+                    try pipeline.callStreamingBatch(ctx.gpa, ctx.io, &.{conversation}, &.{&queue});
                 }
                 try stdout.print("\n", .{});
             } else {
-                var res = try pipeline.call(conversation);
-                defer res.deinit(ctx.gpa);
-                try stdout.print("{s}\n", .{res.items});
+                // var res = try pipeline.call(conversation);
+                // defer res.deinit(ctx.gpa);
+                // try stdout.print("{s}\n", .{res.items});
             }
         },
         .empty => {},
@@ -95,12 +95,12 @@ fn handleChat(ctx: Context, a: args.ChatArgs) !void {
 
     switch (info.config) {
         .qwen_config => {
-            var pipeline = try models.qwen.Handler.buildPipeline(ctx, &info, .{});
-            defer pipeline.deinit();
+            var pipeline = try models.qwen.Pipeline.init(ctx, &info, .{});
+            defer pipeline.deinit(ctx.gpa);
 
             try stdout.print("> ", .{});
             try stdout.flush();
-            var messages: std.ArrayList(template.Message) = .empty;
+            var messages: std.ArrayList(models.chat_template.Message) = .empty;
             defer {
                 for (messages.items) |m| ctx.gpa.free(m.content);
                 messages.deinit(ctx.gpa);
@@ -119,21 +119,21 @@ fn handleChat(ctx: Context, a: args.ChatArgs) !void {
                 try stdout.print("🤖 ", .{});
                 try stdout.flush();
                 {
-                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.collectStreamingResponse)) = .{
+                    const collect_streaming_response_args: std.meta.ArgsTuple(@TypeOf(models.utils.collectStreamingResponse)) = .{
                         ctx.gpa,
                         ctx.io,
                         &queue,
                         &.{ stdout, &model_output_collector.writer },
                         .{},
                     };
-                    const handle = try std.Thread.spawn(.{}, models.collectStreamingResponse, collect_streaming_response_args);
+                    const handle = try std.Thread.spawn(.{}, models.utils.collectStreamingResponse, collect_streaming_response_args);
                     defer {
                         queue.close(ctx.io);
                         std.Thread.join(handle);
                     }
-                    try pipeline.callStreaming(.{ .id = "1", .messages = messages.items }, &queue);
+                    try pipeline.callStreamingBatch(ctx.gpa, ctx.io, &.{.{ .id = "1", .messages = messages.items }}, &.{&queue});
                 }
-                try stdout.print("\n>  ", .{});
+                try stdout.print("\n> ", .{});
                 try stdout.flush();
 
                 try messages.append(

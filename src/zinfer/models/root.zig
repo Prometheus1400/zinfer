@@ -6,6 +6,8 @@ const Queue = std.Io.Queue;
 
 pub const qwen = @import("qwen.zig");
 pub const common = @import("common.zig");
+pub const chat_template = @import("chat_template.zig");
+pub const utils = @import("utils.zig");
 
 pub const ModelConfig = union(enum) {
     const Self = @This();
@@ -81,19 +83,19 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
         });
         errdefer qwen_config.deinit();
 
-        const weights_file_path = try std.mem.concatWithSentinel(ctx.gpa, u8, &.{ model_dir_path, "/", qwen.Handler.WEIGHTS_FILE }, 0);
+        const weights_file_path = try std.mem.concatWithSentinel(ctx.gpa, u8, &.{ model_dir_path, "/", qwen.WEIGHTS_FILE }, 0);
         errdefer ctx.gpa.free(weights_file_path);
 
-        const tokenizer_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.TOKENIZER_FILE });
+        const tokenizer_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.TOKENIZER_FILE });
         errdefer ctx.gpa.free(tokenizer_file_path);
 
-        const tokenizer_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.TOKENIZER_CONFIG_FILE });
+        const tokenizer_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.TOKENIZER_CONFIG_FILE });
         errdefer ctx.gpa.free(tokenizer_config_file_path);
 
-        const generation_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.Handler.GENERATION_CONFIG_FILE });
+        const generation_config_file_path = try ctx.gpa.print("{s}/{s}", .{ model_dir_path, qwen.GENERATION_CONFIG_FILE });
         errdefer ctx.gpa.free(generation_config_file_path);
 
-        const generation_json = try model_dir.readFileAlloc(ctx.io, qwen.Handler.GENERATION_CONFIG_FILE, ctx.gpa, .unlimited);
+        const generation_json = try model_dir.readFileAlloc(ctx.io, qwen.GENERATION_CONFIG_FILE, ctx.gpa, .unlimited);
         defer ctx.gpa.free(generation_json);
 
         const generation_config = try std.json.parseFromSlice(GenerationConfig, ctx.gpa, generation_json, .{
@@ -119,24 +121,4 @@ pub fn getModelInfo(ctx: Context, model: []const u8) !ModelInfo {
     }
 
     return error.UnknownModel;
-}
-
-// todo -> make take in multiple writers
-pub fn collectStreamingResponse(gpa: std.mem.Allocator, io: std.Io, queue: *Queue([]const u8), writers: []const *std.Io.Writer, options: struct { flush: bool = true }) !void {
-    while (true) {
-        const token = queue.getOne(io) catch |e| {
-            switch (e) {
-                error.Closed => break,
-                error.Canceled => return e,
-            }
-        };
-        defer gpa.free(token);
-
-        for (writers) |writer| {
-            try writer.writeAll(token);
-            if (options.flush) {
-                try writer.flush();
-            }
-        }
-    }
 }
