@@ -2,3 +2,5 @@
 zig-out/
 .DS_Store
 /models/
+/response-*.json
+/zig-pkg/
