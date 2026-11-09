@@ -1,4 +1,5 @@
 const std = @import("std");
+const Clock = std.Io.Clock.awake;
 
 const loadWeight = @import("weights.zig").load;
 
@@ -7,6 +8,7 @@ const Stream = @import("../stream.zig").Stream;
 const SwiGluBlock = @import("swiglu.zig").SwiGluBlock;
 const Tensor = @import("../tensor.zig").Tensor;
 const ContiguousKVCache = @import("cache.zig").ContiguousKVCache;
+const ForwardTimings = @import("../forward_timings.zig").ForwardTimings;
 
 pub const Config = struct {
     num_attention_heads: usize,
@@ -21,6 +23,7 @@ pub const AttentionContext = struct {
     kv_caches: []const *ContiguousKVCache,
     /// mapping to look up the actual non-padded tokens for a row in the batch
     real_token_counts: []const usize,
+    timings: ?*ForwardTimings = null,
 };
 
 pub const TransformerBlock = struct {
@@ -215,6 +218,7 @@ pub const AttentionBlock = struct {
             );
         }
 
+        const cache_mask_started = if (opts.timings) |t| Clock.now(t.io) else null;
         const kv_shape = try k.shape();
         const new_kv_shape = [_]c_int{
             kv_shape[0], // batch
@@ -339,6 +343,10 @@ pub const AttentionBlock = struct {
         });
         defer attention_mask.deinit();
         // TODO: understand this better stop ---------------------------------------
+
+        if (opts.timings) |t| {
+            t.cache_mask_build_ns += cache_mask_started.?.durationTo(Clock.now(t.io)).toNanoseconds();
+        }
 
         var attention_output = try Tensor.scaledDotProductAttention(
             q_heads,

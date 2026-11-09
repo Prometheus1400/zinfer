@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: zinfer-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:${ZINFER_PROMETHEUS_PORT}
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 1s
+      httpMethod: POST

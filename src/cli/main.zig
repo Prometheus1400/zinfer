@@ -1,10 +1,10 @@
 const std = @import("std");
 const args = @import("args.zig");
+const server = @import("server/main.zig");
 const build_options = @import("build_options");
 const zinfer = @import("zinfer");
 const mlx = zinfer.mlx;
 const models = zinfer.models;
-
 
 const Context = zinfer.Context;
 const Queue = std.Io.Queue;
@@ -147,10 +147,13 @@ fn handleChat(ctx: Context, a: args.ChatArgs) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    const parsed_args = try args.parseArgs(init.minimal.args);
+    if (parsed_args.command) |c| {
+        if (c == .serve) return server.run(init, c.serve);
+    }
     var stream = try mlx.init(.{});
     defer stream.deinit();
     const ctx: Context = .{ .gpa = init.gpa, .io = init.io, .stream = stream };
-    const parsed_args = try args.parseArgs(init.minimal.args);
     if (parsed_args.command) |c| {
         switch (c) {
             .inspect => {
@@ -162,6 +165,8 @@ pub fn main(init: std.process.Init) !void {
             .chat => {
                 try handleChat(ctx, c.chat);
             },
+            .connect => {},
+            .serve => unreachable,
         }
     }
 }

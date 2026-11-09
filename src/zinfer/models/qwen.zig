@@ -3,6 +3,7 @@ const models = @import("root.zig");
 const std = @import("std");
 const template = @import("chat_template.zig");
 const common = @import("common.zig");
+const Clock = std.Io.Clock.awake;
 
 const cache = mlx.nn.cache;
 
@@ -138,15 +139,24 @@ pub const Batch = struct {
     conversation_ids: std.ArrayList([]const u8), //view
     max_size: usize = 32,
 
-    pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
-        for (self.list) |b| b.deinit(gpa);
-        self.list.deinit(gpa);
+    pub fn init(max_size: ?usize) Self {
+        return .{
+            .list = .empty,
+            .conversation_ids = .empty,
+            .max_size = max_size orelse 32,
+        };
     }
 
-    pub fn permit(self: *Self, gpa: std.mem.Allocator, item: []const c_int, conversation_id: []const u8) !void {
+    pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+        for (self.list.items) |*b| b.deinit(gpa);
+        self.list.deinit(gpa);
+        self.conversation_ids.deinit(gpa);
+    }
+
+    pub fn permit(self: *Self, gpa: std.mem.Allocator, item: []c_int, conversation_id: []const u8) !void {
         if (self.list.items.len >= self.max_size) return error.BatchFull;
-        try self.list.append(gpa, item);
-        try self.conversation_id.append(gpa, conversation_id);
+        try self.list.append(gpa, .fromOwnedSlice(item));
+        try self.conversation_ids.append(gpa, conversation_id);
     }
 
     // Increases the seq-length of the batches by adding the new tokens. Never increases the number of items
@@ -168,7 +178,25 @@ pub const Batch = struct {
             _ = self.conversation_ids.orderedRemove(i);
         }
 
-        return to_remove.items;
+        return to_remove.toOwnedSlice(gpa);
+    }
+
+    pub fn drain(self: *Self, gpa: std.mem.Allocator) !struct { list: [][]c_int, conversation_ids: [][]const u8 } {
+        var list = try gpa.alloc([]c_int, self.list.items.len);
+        for (self.list.items, 0..) |*item, i| {
+            list[i] = try item.toOwnedSlice(gpa);
+        }
+        self.list.clearRetainingCapacity();
+        const conversation_ids = try self.conversation_ids.toOwnedSlice(gpa);
+
+        return .{ .list = list, .conversation_ids = conversation_ids };
+    }
+
+    pub fn full(self: Self) bool {
+        return self.list.items.len >= self.max_size;
+    }
+    pub fn empty(self: Self) bool {
+        return self.list.items.len == 0;
     }
 };
 
@@ -265,23 +293,6 @@ pub const Pipeline = struct {
         };
     }
 
-    // pub fn call(
-    //     self: *Self,
-    //     input: union(enum) {
-    //         conversation: common.Conversation,
-    //         conversations: []const common.Conversation,
-    //     },
-    //     opts: struct {
-    //         stream: bool = false,
-    //         output: ?union(enum) {
-    //             channel: *Queue([]const u8),
-    //             channels: []const *Queue([]const u8),
-    //         },
-    //     },
-    // ) !void {
-    //
-    // }
-
     pub fn forward(
         self: *Self,
         gpa: std.mem.Allocator,
@@ -289,6 +300,7 @@ pub const Pipeline = struct {
         // batch: []const []const c_int,
         opts: struct {
             prefill: bool,
+            timings: ?*mlx.ForwardTimings = null,
             // cached_token_ids: []const []const c_int,
             // conversation_ids: []const []const u8,
             // real_token_counts: []const usize,
@@ -323,6 +335,7 @@ pub const Pipeline = struct {
         }
         const padded_uncached_token_ids = try common.padBatch(arena, uncached_token_ids_batch);
         const input = try common.batchToTensor(arena, padded_uncached_token_ids);
+        const graph_started = if (opts.timings) |t| Clock.now(t.io) else null;
         var sampled = try self.forwardTensor(
             gpa,
             input,
@@ -331,8 +344,12 @@ pub const Pipeline = struct {
                 .conversation_ids = batch.conversation_ids.items,
                 .real_token_counts = real_token_counts,
                 .prefill = opts.prefill,
+                .timings = opts.timings,
             },
         );
+        if (opts.timings) |t| {
+            t.graph_build_ns += graph_started.?.durationTo(Clock.now(t.io)).toNanoseconds();
+        }
 
         for (uncached_token_ids_batch, batch.conversation_ids.items) |uncached_token_id, conversation_id| {
             try self.conversation_states.getPtr(conversation_id).?.cached_token_ids.appendSlice(gpa, uncached_token_id);
@@ -341,11 +358,15 @@ pub const Pipeline = struct {
         // using self.gpa since it's owned
         const token_ids = try gpa.alloc(?c_int, try sampled.dim(0));
         errdefer gpa.free(token_ids);
+        const evaluation_started = if (opts.timings) |t| Clock.now(t.io) else null;
         for (token_ids, 0..) |*id, r| {
             const row: c_int = @intCast(r);
             var sampled_row = try sampled.slice(&.{ row, 0 }, &.{ row + 1, 1 }, &.{ 1, 1 }, self.strm);
             defer sampled_row.deinit();
             id.* = @intCast(try sampled_row.itemU32());
+        }
+        if (opts.timings) |t| {
+            t.evaluation_ns += evaluation_started.?.durationTo(Clock.now(t.io)).toNanoseconds();
         }
 
         for (token_ids) |*opt_token_id| {
@@ -368,6 +389,7 @@ pub const Pipeline = struct {
             conversation_ids: []const []const u8,
             real_token_counts: []const usize,
             prefill: bool,
+            timings: ?*mlx.ForwardTimings = null,
         },
     ) !Tensor {
         // Look up an embedding vector for each input token ID.
@@ -390,6 +412,7 @@ pub const Pipeline = struct {
                     .prefill = ctx.prefill,
                     .kv_caches = layer_caches,
                     .real_token_counts = ctx.real_token_counts,
+                    .timings = ctx.timings,
                 },
             );
             x.deinit();
@@ -492,27 +515,15 @@ pub const Pipeline = struct {
             token_ids_batch.appendAssumeCapacity(.fromOwnedSlice(encoded_row));
         }
         var conversation_ids: std.ArrayList([]const u8) = try .initCapacity(arena, conversations.len);
-        for (conversations) |conversation| {
-            conversation_ids.appendAssumeCapacity(conversation.id);
-        }
+        for (conversations) |conversation| conversation_ids.appendAssumeCapacity(conversation.id);
         var queue_view: std.ArrayList(*Queue([]const u8)) = .fromOwnedSlice(try arena.dupe(*Queue([]const u8), outputs));
-
-        var batch: Batch = .{
-            .list = token_ids_batch,
-            .conversation_ids = conversation_ids,
-        };
+        var batch: Batch = .{ .list = token_ids_batch, .conversation_ids = conversation_ids };
 
         var prefill = true;
         while (batch.list.items.len > 0) {
             defer prefill = false;
 
-            const generated_token_ids = try self.forward(
-                gpa,
-                batch,
-                .{
-                    .prefill = prefill,
-                },
-            );
+            const generated_token_ids = try self.forward(gpa, batch, .{ .prefill = prefill });
             defer gpa.free(generated_token_ids);
 
             const removed = try batch.update(arena, generated_token_ids);
@@ -549,6 +560,10 @@ pub const Pipeline = struct {
         return writer.toArrayList();
     }
 
+    pub fn is_conversation_cached(self: Self, conversation_id: []const u8) bool {
+        const state = self.conversation_states.get(conversation_id) orelse return false;
+        return state.cached_token_ids.items.len > 0;
+    }
 };
 
 // Requires the local models/qwen checkpoint and the native MLX libraries.

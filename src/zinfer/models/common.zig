@@ -74,7 +74,7 @@ pub fn applyChatTemplateAndTokenize(gpa: std.mem.Allocator, batch: []const Conve
     }
     for (batch, 0..) |conversation, i| {
         const prompt = try chat_template.render(gpa, conversation.messages, .{});
-        errdefer gpa.free(prompt);
+        defer gpa.free(prompt);
         encodings[i] = try tokenizer.encode(gpa, prompt);
     }
     return encodings;

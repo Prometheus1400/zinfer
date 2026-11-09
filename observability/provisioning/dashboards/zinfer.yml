@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: zinfer
+    orgId: 1
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: ${ZINFER_OBSERVABILITY_DIR}/dashboards

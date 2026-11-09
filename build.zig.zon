@@ -3,6 +3,11 @@
     .version = "0.0.0",
     .fingerprint = 0xbe7b22683808fee9,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .metrics = .{
+            .url = "git+https://github.com/karlseguin/metrics.zig#3676413b54c8b36c3aca2c22500aaf065ff2b45d",
+            .hash = "metrics-0.0.0-W7G4eIqtAQDVZUfnac9O7sSc12T4Mf4E0wVrbQMJzAPu",
+        },
+    },
     .paths = .{ "build.zig", "build.zig.zon", "cmake", "src", "vendor", "README.md" },
 }

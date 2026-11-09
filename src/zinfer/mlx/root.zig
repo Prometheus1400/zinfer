@@ -8,3 +8,4 @@ pub const InitOptions = @import("stream.zig").InitOptions;
 pub const Map = @import("map.zig").Map;
 pub const Stream = @import("stream.zig").Stream;
 pub const Tensor = @import("tensor.zig").Tensor;
+pub const ForwardTimings = @import("forward_timings.zig").ForwardTimings;
